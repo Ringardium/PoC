@@ -44,10 +44,20 @@ def detect_fight(
     reset_frames,
     flag_frames,
     width,
-    height
+    height,
+    speeds=None,
+    fight_speed_threshold=5.0,
 ):
-    def diff(c2, c1):
-        return np.tile(c2[None, :], (len(c2), 1)) - np.tile(c1[:, None], (1, len(c1)))
+    """Detect fighting between pets.
+
+    Args:
+        speeds: dict mapping track_id -> average speed (pixels/frame).
+            When provided, close_count only increments if BOTH dogs in the
+            pair exceed ``fight_speed_threshold``.  This filters out calm
+            proximity (resting together, playing gently).
+        fight_speed_threshold: minimum average speed for both dogs to count
+            as a fighting interaction.
+    """
 
     bbox_coor = np.stack((x_centers - width / 2, y_centers - height / 2, x_centers + width / 2, y_centers + height / 2), axis=1)
 
@@ -55,7 +65,16 @@ def detect_fight(
 
     tracked_ids = []
     for i, j in triu_where(iou > threshold, iou):
-        tracked_ids.append((track_ids[i], track_ids[j]))
+        id_i, id_j = track_ids[i], track_ids[j]
+
+        # If speeds provided, only count when both dogs are moving fast
+        if speeds is not None:
+            speed_i = speeds.get(id_i, 0.0)
+            speed_j = speeds.get(id_j, 0.0)
+            if speed_i < fight_speed_threshold or speed_j < fight_speed_threshold:
+                continue
+
+        tracked_ids.append((id_i, id_j))
 
     far_count += 1
     for i, j in tracked_ids:

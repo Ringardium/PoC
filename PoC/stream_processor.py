@@ -2,12 +2,17 @@
 
 import asyncio
 import logging
+import os
 import sys
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+# Suppress FFmpeg HEVC decoder warnings (POC ref not found, PPS out of range)
+# These are non-fatal warnings from B-frame decoding in HEVC RTSP streams.
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "error"
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -15,6 +20,7 @@ import numpy as np
 import torch
 
 from config import SystemConfig, StreamConfig, GPUConfig, ProcessingConfig
+from event_sender import SleepStateTracker, EventSender
 from monitor import StatsAggregator
 
 logger = logging.getLogger(__name__)
@@ -41,6 +47,7 @@ class StreamState:
         self.eat_near_count: Dict = {}
         self.bathroom_coor: Dict = {}
         self.bathroom_bbox: Dict = {}
+        self.active_coor: Dict = {}
         self.close_count: Optional[torch.Tensor] = None
         self.far_count: Optional[torch.Tensor] = None
         # DeepSORT tracker
@@ -72,6 +79,12 @@ class MultiStreamProcessor:
         self._model = None
         self._model_lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Sleep event tracking (per-stream)
+        self._sleep_trackers: Dict[str, SleepStateTracker] = {}
+        self._event_sender: Optional[EventSender] = None
+        if config.event_api_url:
+            self._event_sender = EventSender(config.event_api_url)
 
         # Register initial streams
         for sc in config.streams:
@@ -119,6 +132,8 @@ class MultiStreamProcessor:
         self.streams[sc.stream_id] = sc
         self._states[sc.stream_id] = StreamState(sc)
         self._stats.register_stream(sc.stream_id)
+        if sc.task_sleep:
+            self._sleep_trackers[sc.stream_id] = SleepStateTracker()
 
     def _unregister_stream(self, stream_id: str):
         state = self._states.get(stream_id)
@@ -195,6 +210,8 @@ class MultiStreamProcessor:
                 state.writer.release()
         self._executor.shutdown(wait=False)
         self._stats.cleanup()
+        if self._event_sender:
+            self._event_sender.stop()
 
     # ------------------------------------------------------------------
     # Per-stream processing loop
@@ -219,7 +236,7 @@ class MultiStreamProcessor:
         state.active = True
 
         needs_yolo = bool(sc.yolo_classes) and self._model is not None
-        needs_behavior = sc.task_fight or sc.task_escape or sc.task_inert or sc.task_sleep or sc.task_eat or sc.task_bathroom
+        needs_behavior = sc.task_fight or sc.task_escape or sc.task_inert or sc.task_sleep or sc.task_eat or sc.task_bathroom or sc.task_active
 
         if needs_behavior:
             state.init_behavior_state()
@@ -342,6 +359,13 @@ class MultiStreamProcessor:
     def _do_open_capture(source: str) -> Optional[cv2.VideoCapture]:
         if source.isdigit():
             cap = cv2.VideoCapture(int(source))
+        elif source.lower().startswith("rtsp://"):
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|analyzeduration;5000000|probesize;5000000"
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            # Flush initial frames to skip past incomplete GOP
+            if cap.isOpened():
+                for _ in range(30):
+                    cap.grab()
         else:
             cap = cv2.VideoCapture(source)
         if cap.isOpened():
@@ -381,6 +405,7 @@ class MultiStreamProcessor:
         from detect_sleep import detect_sleep
         from detect_eat import detect_eat
         from detect_bathroom import detect_bathroom
+        from detect_active import detect_active
 
         # Prepare coordinates
         for tid in track_ids:
@@ -394,6 +419,8 @@ class MultiStreamProcessor:
             if tid not in state.bathroom_coor:
                 state.bathroom_coor[tid] = deque([], maxlen=sc.bathroom_trigger_frames * 2)
                 state.bathroom_bbox[tid] = deque([], maxlen=sc.bathroom_trigger_frames * 2)
+            if tid not in state.active_coor:
+                state.active_coor[tid] = deque([], maxlen=sc.active_frames)
 
         id_to_idx = {tid: i for i, tid in enumerate(track_ids)}
         x_centers, y_centers = [], []
@@ -413,10 +440,22 @@ class MultiStreamProcessor:
             state.eat_coor[tid].append([xc, yc])
             state.bathroom_coor[tid].append([xc, yc])
             state.bathroom_bbox[tid].append([w, h])
+            state.active_coor[tid].append([xc, yc])
 
         x_arr = np.array(x_centers)
         y_arr = np.array(y_centers)
         status_parts = []
+
+        # Compute per-dog speeds for fight detection
+        speeds = {}
+        for tid in track_ids:
+            if tid in state.inert_coor and len(state.inert_coor[tid]) >= 2:
+                coor = np.array(state.inert_coor[tid])
+                recent = coor[-min(10, len(coor)):]
+                dists = np.sqrt(np.sum((recent[1:] - recent[:-1]) ** 2, axis=1))
+                speeds[tid] = float(np.mean(dists))
+            else:
+                speeds[tid] = 0.0
 
         # Fight detection
         if sc.task_fight and state.close_count is not None:
@@ -424,6 +463,8 @@ class MultiStreamProcessor:
                 x_arr, y_arr, track_ids, state.close_count, state.far_count,
                 sc.threshold, sc.reset_frames, sc.flag_frames,
                 last_w, last_h,
+                speeds=speeds,
+                fight_speed_threshold=sc.fight_speed_threshold,
             )
             for ids in fight_indices:
                 for i in ids:
@@ -491,6 +532,14 @@ class MultiStreamProcessor:
                 if stats:
                     stats.detections["sleep"] = stats.detections.get("sleep", 0) + len(sleep_ids)
 
+            # Track sleep state transitions and send events on sleep end
+            sleep_tracker = self._sleep_trackers.get(sc.stream_id)
+            if sleep_tracker:
+                ended = sleep_tracker.update(sleep_ids, state.frame_cnt, sc.target_fps)
+                if ended and self._event_sender:
+                    for ev in ended:
+                        self._event_sender.send(ev)
+
         # Eat detection
         if sc.task_eat and self._model is not None:
             with self._model_lock:
@@ -542,6 +591,25 @@ class MultiStreamProcessor:
                 stats = self._stats.get_stream_stats(sc.stream_id)
                 if stats:
                     stats.detections["bathroom"] = stats.detections.get("bathroom", 0) + len(bathroom_ids)
+
+        # Active detection
+        if sc.task_active:
+            active_ids = detect_active(
+                state.active_coor, sc.active_threshold, sc.active_frames,
+            )
+            for tid in active_ids:
+                idx = id_to_idx.get(tid)
+                if idx is not None:
+                    bx = boxes[idx]
+                    xc, yc, w, h = (bx.tolist() if hasattr(bx, 'tolist') else bx)
+                    pt1 = (int(xc - w / 2), int(yc - h / 2))
+                    pt2 = (int(xc + w / 2), int(yc + h / 2))
+                    cv2.rectangle(frame, pt1, pt2, (0, 255, 255), 2)
+            if active_ids:
+                status_parts.append("Active")
+                stats = self._stats.get_stream_stats(sc.stream_id)
+                if stats:
+                    stats.detections["active"] = stats.detections.get("active", 0) + len(active_ids)
 
         if status_parts:
             cv2.putText(

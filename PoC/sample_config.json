@@ -60,5 +60,6 @@
     }
   ],
   "log_level": "INFO",
-  "stats_interval": 5.0
+  "stats_interval": 5.0,
+  "event_api_url": null
 }

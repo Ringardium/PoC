@@ -19,7 +19,9 @@ class StreamConfig:
     task_sleep: bool = False
     task_eat: bool = False
     task_bathroom: bool = False
-    threshold: float = 0.1
+    task_active: bool = False
+    threshold: float = 0.3
+    fight_speed_threshold: float = 5.0
     inert_threshold: float = 50.0
     inert_frames: int = 100
     sleep_threshold: float = 30.0
@@ -34,6 +36,8 @@ class StreamConfig:
     bathroom_trigger_frames: int = 30
     bathroom_height_drop: float = 0.25
     bathroom_cls_conf: float = 0.5
+    active_threshold: float = 200.0
+    active_frames: int = 60
     reset_frames: int = 20
     flag_frames: int = 40
     priority: int = 1  # 1=highest, 3=lowest
@@ -96,6 +100,7 @@ class SystemConfig:
     streams: List[StreamConfig] = field(default_factory=list)
     log_level: str = "INFO"
     stats_interval: float = 5.0  # seconds
+    event_api_url: Optional[str] = None  # Backend URL for behavior events (None = disabled)
 
     def to_dict(self) -> dict:
         data = {
@@ -107,7 +112,8 @@ class SystemConfig:
             },
             "streams": [s.to_dict() for s in self.streams],
             "log_level": self.log_level,
-            "stats_interval": self.stats_interval
+            "stats_interval": self.stats_interval,
+            "event_api_url": self.event_api_url
         }
         return data
 
@@ -128,7 +134,8 @@ class SystemConfig:
             processing=processing,
             streams=streams,
             log_level=data.get("log_level", "INFO"),
-            stats_interval=data.get("stats_interval", 5.0)
+            stats_interval=data.get("stats_interval", 5.0),
+            event_api_url=data.get("event_api_url")
         )
 
     def save(self, path: str):
