@@ -1,0 +1,16 @@
+ultralytics
+torch
+numpy
+lap
+click
+av
+psutil
+tensorflow
+onnx
+onnx2tf
+onnxruntime
+pytorch-lightning
+albumentations
+tensorboard
+supervision
+Pillow

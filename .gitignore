@@ -1,0 +1,33 @@
+# Model weights
+*.pt
+*.onnx
+*.mlpackage
+*.ckpt
+*.pth
+
+# Data / videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Archives
+*.zip
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Images (optional large files)
+*.png
+*.jpg
+*.jpeg

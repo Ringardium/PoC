@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pet Tracker - Multi-Stream Monitor</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            background: #16213e;
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 2px solid #0f3460;
+        }
+        .header h1 {
+            font-size: 1.3rem;
+            color: #e94560;
+        }
+        .header .connection-status {
+            font-size: 0.85rem;
+            padding: 4px 12px;
+            border-radius: 12px;
+            background: #333;
+        }
+        .header .connection-status.connected { background: #1b5e20; }
+        .header .connection-status.disconnected { background: #b71c1c; }
+
+        /* System Stats Bar */
+        .stats-bar {
+            background: #16213e;
+            padding: 10px 24px;
+            display: flex;
+            gap: 24px;
+            flex-wrap: wrap;
+            border-bottom: 1px solid #0f3460;
+            font-size: 0.9rem;
+        }
+        .stat-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .stat-label { color: #888; }
+        .stat-value { color: #4fc3f7; font-weight: bold; }
+        .stat-value.warn { color: #ffb74d; }
+        .stat-value.danger { color: #ef5350; }
+
+        /* Stream Grid */
+        .grid-container {
+            padding: 16px;
+            display: grid;
+            gap: 16px;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+        }
+
+        /* Stream Card */
+        .stream-card {
+            background: #16213e;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 1px solid #0f3460;
+        }
+        .stream-card .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 12px;
+            background: #0f3460;
+        }
+        .stream-card .card-header .stream-name {
+            font-weight: bold;
+            font-size: 0.95rem;
+        }
+        .stream-card .card-header .stream-fps {
+            color: #4fc3f7;
+            font-size: 0.85rem;
+        }
+        .stream-card .card-body {
+            position: relative;
+            background: #000;
+            aspect-ratio: 1 / 1;
+        }
+        .stream-card .card-body canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+        .stream-card .card-body .no-signal {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+            font-size: 1.1rem;
+        }
+        .stream-card .card-footer {
+            padding: 6px 12px;
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.8rem;
+            color: #aaa;
+            border-top: 1px solid #0f3460;
+        }
+        .detection-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            margin-left: 4px;
+            font-weight: bold;
+        }
+        .badge-fight { background: #b71c1c; color: #fff; }
+        .badge-escape { background: #e65100; color: #fff; }
+        .badge-inert { background: #1b5e20; color: #fff; }
+        .badge-reid { background: #4a148c; color: #fff; }
+
+        /* Detail Panel */
+        .detail-panel {
+            padding: 12px 24px;
+            background: #16213e;
+            border-top: 2px solid #0f3460;
+            font-size: 0.85rem;
+            display: flex;
+            gap: 24px;
+            flex-wrap: wrap;
+        }
+        .detail-item {
+            display: flex;
+            gap: 6px;
+        }
+
+        /* Add Stream Toolbar */
+        .toolbar {
+            background: #16213e;
+            padding: 10px 24px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            border-bottom: 1px solid #0f3460;
+        }
+        .toolbar input, .toolbar select {
+            background: #1a1a2e;
+            color: #eee;
+            border: 1px solid #0f3460;
+            border-radius: 4px;
+            padding: 6px 10px;
+            font-size: 0.85rem;
+        }
+        .toolbar input::placeholder { color: #666; }
+        .toolbar input:focus, .toolbar select:focus {
+            outline: none;
+            border-color: #4fc3f7;
+        }
+        .toolbar button {
+            padding: 6px 16px;
+            border: none;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        .btn-add { background: #1b5e20; color: #fff; }
+        .btn-add:hover { background: #2e7d32; }
+        .btn-add:disabled { background: #555; cursor: not-allowed; }
+
+        /* Delete button on card */
+        .btn-delete {
+            background: none;
+            border: none;
+            color: #ef5350;
+            cursor: pointer;
+            font-size: 1rem;
+            padding: 0 4px;
+            line-height: 1;
+        }
+        .btn-delete:hover { color: #ff7043; }
+
+        /* Checkboxes */
+        .toolbar label {
+            font-size: 0.8rem;
+            color: #aaa;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .toolbar label input[type="checkbox"] { accent-color: #4fc3f7; }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <div class="header">
+        <h1>Pet Tracker - Multi-Stream Monitor</h1>
+        <span id="connStatus" class="connection-status disconnected">Disconnected</span>
+    </div>
+
+    <!-- System Stats Bar -->
+    <div class="stats-bar" id="statsBar">
+        <div class="stat-item">
+            <span class="stat-label">Streams:</span>
+            <span class="stat-value" id="statStreams">0</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Total FPS:</span>
+            <span class="stat-value" id="statFps">0</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">CPU:</span>
+            <span class="stat-value" id="statCpu">0%</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">GPU:</span>
+            <span class="stat-value" id="statGpu">0%</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">GPU Mem:</span>
+            <span class="stat-value" id="statGpuMem">0 GB</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Temp:</span>
+            <span class="stat-value" id="statTemp">0C</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Processed:</span>
+            <span class="stat-value" id="statProcessed">0</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Dropped:</span>
+            <span class="stat-value" id="statDropped">0</span>
+        </div>
+    </div>
+
+    <!-- Add Stream Toolbar -->
+    <div class="toolbar">
+        <input type="text" id="addStreamId" placeholder="Stream ID" style="width:120px;">
+        <input type="text" id="addSource" placeholder="Source (file / rtsp:// / 0)" style="width:260px;">
+        <select id="addMethod">
+            <option value="bytetrack">ByteTrack</option>
+            <option value="botsort">BoT-SORT</option>
+            <option value="deepsort">DeepSORT</option>
+        </select>
+        <label><input type="checkbox" id="addFight" checked> Fight</label>
+        <label><input type="checkbox" id="addInert" checked> Inert</label>
+        <label><input type="checkbox" id="addEscape"> Escape</label>
+        <label><input type="checkbox" id="addReID" checked> ReID</label>
+        <button class="btn-add" id="btnAddStream" onclick="addStream()">+ Add Stream</button>
+        <span id="addMsg" style="font-size:0.8rem;color:#888;"></span>
+    </div>
+
+    <!-- Stream Grid -->
+    <div class="grid-container" id="gridContainer"></div>
+
+    <!-- Detail Panel -->
+    <div class="detail-panel" id="detailPanel"></div>
+
+    <script>
+        // State
+        const streamData = {};       // stream_id -> { ws, canvas, ctx, img, stats }
+        let statsInterval = null;
+
+        // === Initialize ===
+        async function init() {
+            try {
+                const res = await fetch('/api/streams');
+                const data = await res.json();
+                if (data.streams && data.streams.length > 0) {
+                    createGrid(data.streams);
+                    data.streams.forEach(s => connectStream(s.stream_id));
+                    updateConnectionStatus(true);
+                } else {
+                    document.getElementById('gridContainer').innerHTML =
+                        '<p style="padding:24px;color:#888;">No streams configured.</p>';
+                }
+            } catch (e) {
+                console.error('Failed to fetch streams:', e);
+                updateConnectionStatus(false);
+                setTimeout(init, 3000);
+                return;
+            }
+
+            // Start stats polling
+            statsInterval = setInterval(fetchStats, 1000);
+        }
+
+        // === Create Grid ===
+        function createGrid(streams) {
+            const grid = document.getElementById('gridContainer');
+            grid.innerHTML = '';
+
+            streams.forEach(s => addStreamCard(s));
+        }
+
+        function addStreamCard(s) {
+            const grid = document.getElementById('gridContainer');
+            // Remove "no streams" message if present
+            const noMsg = grid.querySelector('p');
+            if (noMsg) noMsg.remove();
+
+            const card = document.createElement('div');
+            card.className = 'stream-card';
+            card.id = `card-${s.stream_id}`;
+            card.innerHTML = `
+                <div class="card-header">
+                    <span class="stream-name">${s.stream_id}</span>
+                    <span>
+                        <span class="stream-fps" id="fps-${s.stream_id}">-- fps</span>
+                        <button class="btn-delete" onclick="removeStream('${s.stream_id}')" title="Remove stream">X</button>
+                    </span>
+                </div>
+                <div class="card-body">
+                    <canvas id="canvas-${s.stream_id}"></canvas>
+                    <div class="no-signal" id="nosignal-${s.stream_id}">Waiting for frames...</div>
+                </div>
+                <div class="card-footer" id="footer-${s.stream_id}">
+                    <span>Objects: 0</span>
+                    <span>${s.method} ${s.use_reid ? '| ReID' : ''}</span>
+                </div>
+            `;
+            grid.appendChild(card);
+
+            const canvas = document.getElementById(`canvas-${s.stream_id}`);
+            const ctx = canvas.getContext('2d');
+            streamData[s.stream_id] = { canvas, ctx, img: new Image(), stats: null };
+        }
+
+        // === WebSocket per stream ===
+        function connectStream(streamId) {
+            const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${wsProto}//${location.host}/ws/frames/${streamId}`;
+            const ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                console.log(`WS connected: ${streamId}`);
+            };
+
+            ws.onmessage = (event) => {
+                const sd = streamData[streamId];
+                if (!sd) return;
+
+                const blob = new Blob([event.data], { type: 'image/jpeg' });
+                const url = URL.createObjectURL(blob);
+
+                sd.img.onload = () => {
+                    // Resize canvas to match image
+                    if (sd.canvas.width !== sd.img.width || sd.canvas.height !== sd.img.height) {
+                        sd.canvas.width = sd.img.width;
+                        sd.canvas.height = sd.img.height;
+                    }
+                    sd.ctx.drawImage(sd.img, 0, 0);
+                    URL.revokeObjectURL(url);
+
+                    // Hide no-signal
+                    const noSig = document.getElementById(`nosignal-${streamId}`);
+                    if (noSig) noSig.style.display = 'none';
+                };
+                sd.img.src = url;
+            };
+
+            ws.onclose = () => {
+                console.log(`WS closed: ${streamId}`);
+                // Reconnect after 2s
+                setTimeout(() => connectStream(streamId), 2000);
+            };
+
+            ws.onerror = (err) => {
+                console.error(`WS error: ${streamId}`, err);
+                ws.close();
+            };
+
+            if (streamData[streamId]) {
+                streamData[streamId].ws = ws;
+            }
+        }
+
+        // === Stats Polling ===
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                updateStatsBar(data);
+                updateStreamStats(data);
+                updateConnectionStatus(true);
+            } catch (e) {
+                updateConnectionStatus(false);
+            }
+        }
+
+        function updateStatsBar(data) {
+            const sys = data.system || {};
+            const totals = data.totals || {};
+
+            document.getElementById('statStreams').textContent = totals.active_streams || 0;
+            setStatValue('statFps', totals.fps || 0, v => v < 10 ? 'danger' : v < 20 ? 'warn' : '');
+            setStatValue('statCpu', `${sys.cpu_percent || 0}%`, v => parseFloat(v) > 90 ? 'danger' : parseFloat(v) > 70 ? 'warn' : '');
+            setStatValue('statGpu', `${sys.gpu_utilization || 0}%`, v => parseFloat(v) > 95 ? 'danger' : parseFloat(v) > 80 ? 'warn' : '');
+            document.getElementById('statGpuMem').textContent = `${sys.gpu_memory_gb || 0} GB`;
+            document.getElementById('statTemp').textContent = `${sys.gpu_temp || 0}C`;
+            document.getElementById('statProcessed').textContent = totals.frames_processed || 0;
+            setStatValue('statDropped', totals.frames_dropped || 0, v => v > 100 ? 'danger' : v > 10 ? 'warn' : '');
+        }
+
+        function setStatValue(id, value, classFunc) {
+            const el = document.getElementById(id);
+            el.textContent = value;
+            el.className = 'stat-value';
+            const cls = classFunc(value);
+            if (cls) el.classList.add(cls);
+        }
+
+        function updateStreamStats(data) {
+            const streams = data.streams || {};
+            const detailPanel = document.getElementById('detailPanel');
+            const details = [];
+
+            for (const [sid, stats] of Object.entries(streams)) {
+                // Update FPS label
+                const fpsEl = document.getElementById(`fps-${sid}`);
+                if (fpsEl) fpsEl.textContent = `${stats.fps || 0} fps`;
+
+                // Update footer
+                const footerEl = document.getElementById(`footer-${sid}`);
+                if (footerEl) {
+                    const det = stats.detections || {};
+                    let badges = '';
+                    if (det.fight) badges += `<span class="detection-badge badge-fight">Fight: ${det.fight}</span>`;
+                    if (det.escape) badges += `<span class="detection-badge badge-escape">Escape: ${det.escape}</span>`;
+                    if (det.inert) badges += `<span class="detection-badge badge-inert">Inert: ${det.inert}</span>`;
+                    if (det.reid_corrections) badges += `<span class="detection-badge badge-reid">ReID: ${det.reid_corrections}</span>`;
+
+                    footerEl.innerHTML = `
+                        <span>Objects: ${stats.objects || 0} | Latency: ${stats.latency_ms || 0}ms</span>
+                        <span>${badges}</span>
+                    `;
+                }
+
+                // Build detail line
+                const det = stats.detections || {};
+                details.push(`<div class="detail-item">
+                    <strong>${sid}:</strong>
+                    FPS ${stats.fps} | Obj ${stats.objects} |
+                    Fight:${det.fight || 0} Escape:${det.escape || 0} Inert:${det.inert || 0} ReID:${det.reid_corrections || 0}
+                </div>`);
+            }
+
+            detailPanel.innerHTML = details.join('');
+        }
+
+        function updateConnectionStatus(connected) {
+            const el = document.getElementById('connStatus');
+            if (connected) {
+                el.textContent = 'Connected';
+                el.className = 'connection-status connected';
+            } else {
+                el.textContent = 'Disconnected';
+                el.className = 'connection-status disconnected';
+            }
+        }
+
+        // === Add Stream ===
+        async function addStream() {
+            const streamId = document.getElementById('addStreamId').value.trim();
+            const source = document.getElementById('addSource').value.trim();
+            const msgEl = document.getElementById('addMsg');
+
+            if (!streamId || !source) {
+                msgEl.textContent = 'Stream ID and Source are required';
+                msgEl.style.color = '#ef5350';
+                return;
+            }
+
+            const body = {
+                stream_id: streamId,
+                input_source: source,
+                method: document.getElementById('addMethod').value,
+                task_fight: document.getElementById('addFight').checked,
+                task_inert: document.getElementById('addInert').checked,
+                task_escape: document.getElementById('addEscape').checked,
+                use_reid: document.getElementById('addReID').checked,
+                reid_method: 'adaptive',
+                reid_threshold: 0.5,
+                reid_global_id: false,
+                target_fps: 30,
+            };
+
+            const btn = document.getElementById('btnAddStream');
+            btn.disabled = true;
+            msgEl.textContent = 'Adding...';
+            msgEl.style.color = '#888';
+
+            try {
+                const res = await fetch('/api/streams', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+
+                if (res.ok) {
+                    msgEl.textContent = `Added: ${streamId}`;
+                    msgEl.style.color = '#4fc3f7';
+                    // Add card and connect WebSocket
+                    addStreamCard({
+                        stream_id: streamId,
+                        method: body.method,
+                        use_reid: body.use_reid,
+                    });
+                    connectStream(streamId);
+                    // Clear inputs
+                    document.getElementById('addStreamId').value = '';
+                    document.getElementById('addSource').value = '';
+                } else {
+                    msgEl.textContent = data.error || 'Failed';
+                    msgEl.style.color = '#ef5350';
+                }
+            } catch (e) {
+                msgEl.textContent = 'Network error';
+                msgEl.style.color = '#ef5350';
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        // === Remove Stream ===
+        async function removeStream(streamId) {
+            if (!confirm(`Remove stream "${streamId}"?`)) return;
+
+            try {
+                const res = await fetch(`/api/streams/${streamId}`, { method: 'DELETE' });
+                if (res.ok) {
+                    // Close WebSocket
+                    if (streamData[streamId] && streamData[streamId].ws) {
+                        streamData[streamId].ws.onclose = null; // prevent reconnect
+                        streamData[streamId].ws.close();
+                    }
+                    delete streamData[streamId];
+
+                    // Remove card
+                    const card = document.getElementById(`card-${streamId}`);
+                    if (card) card.remove();
+                }
+            } catch (e) {
+                console.error('Failed to remove stream:', e);
+            }
+        }
+
+        // Start
+        window.addEventListener('load', init);
+    </script>
+</body>
+</html>
