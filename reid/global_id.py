@@ -390,7 +390,8 @@ class GlobalIDManager:
         )
 
     def get_global_id(self, channel_id: str, local_id: int,
-                      feature: np.ndarray, box: tuple = None) -> int:
+                      feature: np.ndarray, box: tuple = None,
+                      exclude_gids: set = None) -> int:
         """
         로컬 ID에 대한 글로벌 ID 반환 (하위 호환)
 
@@ -399,12 +400,13 @@ class GlobalIDManager:
             local_id: 로컬 트랙 ID
             feature: 특징 벡터
             box: 바운딩 박스 (선택)
+            exclude_gids: 이번 프레임에서 이미 할당된 global_id (중복 방지)
 
         Returns:
             global_id: 전역 ID
         """
         features = {'appearance': feature} if feature is not None else {}
-        return self._get_global_id_internal(channel_id, local_id, features, box)
+        return self._get_global_id_internal(channel_id, local_id, features, box, exclude_gids)
 
     # === 확장 API ===
 
@@ -427,7 +429,8 @@ class GlobalIDManager:
 
     def _get_global_id_internal(self, channel_id: str, local_id: int,
                                  features: Dict[str, np.ndarray],
-                                 box: tuple = None) -> int:
+                                 box: tuple = None,
+                                 exclude_gids: set = None) -> int:
         """내부 글로벌 ID 획득 로직"""
         key = (channel_id, local_id)
 
@@ -435,13 +438,19 @@ class GlobalIDManager:
         if key in self.local_to_global:
             global_id = self.local_to_global[key]
 
-            if global_id in self.galleries:
-                self._update_gallery(global_id, features, channel_id)
-
-            return global_id
+            # 같은 프레임에서 다른 객체가 이미 이 global_id를 사용 중이면 재매핑
+            if exclude_gids and global_id in exclude_gids:
+                del self.local_to_global[key]
+                self.logger.info(
+                    f"Global ID 충돌: 채널 {channel_id} 로컬 {local_id} -> G:{global_id} 재매핑"
+                )
+            else:
+                if global_id in self.galleries:
+                    self._update_gallery(global_id, features, channel_id)
+                return global_id
 
         # 새로운 로컬 ID - 갤러리에서 매칭 시도
-        matched_gid, similarity = self._find_matching_gallery_multi(features)
+        matched_gid, similarity = self._find_matching_gallery_multi(features, exclude_gids)
 
         if matched_gid is not None:
             global_id = matched_gid
@@ -484,7 +493,8 @@ class GlobalIDManager:
 
         return global_id
 
-    def _find_matching_gallery_multi(self, features: Dict[str, np.ndarray]) -> Tuple[Optional[int], float]:
+    def _find_matching_gallery_multi(self, features: Dict[str, np.ndarray],
+                                      exclude_gids: set = None) -> Tuple[Optional[int], float]:
         """다중 특징으로 갤러리 매칭"""
         if not features:
             return None, 0.0
@@ -493,6 +503,7 @@ class GlobalIDManager:
         active_galleries = {
             gid: gallery for gid, gallery in self.galleries.items()
             if (current_time - gallery.last_seen) < self.inactive_timeout
+            and (exclude_gids is None or gid not in exclude_gids)
         }
 
         if not active_galleries:

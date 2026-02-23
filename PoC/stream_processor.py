@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # Add parent directory for tracking/detection imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from privacy_filter import apply_blur, apply_mosaic, apply_black_box
+from tools import apply_blur, apply_mosaic, apply_black_box
 
 
 class StreamState:
@@ -66,6 +66,10 @@ class StreamState:
         # ReID tracker
         self.reid_tracker = None
         self.global_id_map: Dict = {}
+        self.global_id_names: Dict[int, str] = {}  # global_id -> pet name
+        # ID stabilization buffer: track_id -> {candidate_id, count}
+        self.id_stable_buffer: Dict[int, Dict] = {}
+        self.id_stable_threshold: int = 5  # N consecutive frames to confirm ID change
         # Output writer
         self.writer: Optional[cv2.VideoWriter] = None
         self.active: bool = False
@@ -271,6 +275,7 @@ class MultiStreamProcessor:
         state.width = int(state.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         state.height = int(state.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         state.active = True
+        logger.info(f"[{stream_id}] Capture info: {state.width}x{state.height} @ {state.source_fps}fps")
 
         # Auto-add bowl class (3) if eat detection is enabled
         if sc.task_eat and 3 not in sc.yolo_classes:
@@ -279,10 +284,12 @@ class MultiStreamProcessor:
 
         needs_yolo = bool(sc.yolo_classes) and self._model is not None
         needs_behavior = sc.task_fight or sc.task_escape or sc.task_inert or sc.task_sleep or sc.task_eat or sc.task_bathroom or sc.task_active
+        logger.info(f"[{stream_id}] needs_yolo={needs_yolo}, needs_behavior={needs_behavior}")
 
+        logger.info(f"[{stream_id}] Checking ReID... use_reid={sc.use_reid}, reid_global_id={sc.reid_global_id}")
         # Init ReID tracker
         if sc.use_reid or sc.reid_global_id:
-            from reid_tracker import ReIDTracker
+            from reid import ReIDTracker
             state.reid_tracker = ReIDTracker(
                 reid_method=sc.reid_method,
                 similarity_threshold=sc.reid_threshold,
@@ -291,9 +298,19 @@ class MultiStreamProcessor:
             )
             mode = "full pipeline" if sc.reid_global_id else "ID correction"
             logger.info(f"[{stream_id}] ReID enabled — {mode}, method={sc.reid_method}")
+            # Load pet names from profiles
+            try:
+                from tools.pet_profiles import PetProfileStore
+                store = PetProfileStore("references")
+                state.global_id_names = store.get_name_map()
+                if state.global_id_names:
+                    logger.info(f"[{stream_id}] Pet names loaded: {state.global_id_names}")
+            except Exception:
+                pass
 
         if needs_behavior:
             state.init_behavior_state()
+        logger.info(f"[{stream_id}] Behavior init done")
 
         # Init DeepSORT if needed
         if needs_yolo and sc.method == "deepsort":
@@ -310,6 +327,8 @@ class MultiStreamProcessor:
                 sc.output_path, fourcc, sc.target_fps,
                 (state.width, state.height),
             )
+
+        logger.info(f"[{stream_id}] DeepSORT init done, checking HLS...")
 
         # Init HLS → S3 uploader
         if self.config.hls_s3_bucket:
@@ -375,7 +394,32 @@ class MultiStreamProcessor:
                     # --- ReID correction (optional) ---
                     if state.reid_tracker is not None and len(boxes) > 0:
                         reid_result = state.reid_tracker.process(frame, boxes, track_ids)
-                        track_ids = reid_result['corrected_ids']
+                        raw_corrected = reid_result['corrected_ids']
+
+                        # ID stabilization: only accept correction after N consistent frames
+                        stable_ids = []
+                        for orig_tid, corr_tid in zip(track_ids, raw_corrected):
+                            if orig_tid == corr_tid:
+                                # No correction — clear buffer and keep original
+                                state.id_stable_buffer.pop(orig_tid, None)
+                                stable_ids.append(orig_tid)
+                            else:
+                                buf = state.id_stable_buffer.get(orig_tid)
+                                if buf and buf['candidate'] == corr_tid:
+                                    buf['count'] += 1
+                                else:
+                                    state.id_stable_buffer[orig_tid] = {'candidate': corr_tid, 'count': 1}
+                                    buf = state.id_stable_buffer[orig_tid]
+
+                                if buf['count'] >= state.id_stable_threshold:
+                                    # Confirmed — accept correction
+                                    stable_ids.append(corr_tid)
+                                    state.id_stable_buffer.pop(orig_tid, None)
+                                else:
+                                    # Not yet confirmed — keep original
+                                    stable_ids.append(orig_tid)
+
+                        track_ids = stable_ids
                         if reid_result.get('global_ids'):
                             for tid, gid in zip(track_ids, reid_result['global_ids']):
                                 state.global_id_map[tid] = gid
@@ -459,6 +503,8 @@ class MultiStreamProcessor:
 
     @staticmethod
     def _do_open_capture(source: str) -> Optional[cv2.VideoCapture]:
+        logger.info(f"Opening capture: {source}")
+        t0 = time.perf_counter()
         if source.isdigit():
             cap = cv2.VideoCapture(int(source))
         elif source.lower().startswith("rtsp://"):
@@ -476,8 +522,11 @@ class MultiStreamProcessor:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         else:
             cap = cv2.VideoCapture(source)
+        elapsed = time.perf_counter() - t0
         if cap.isOpened():
+            logger.info(f"Capture opened in {elapsed:.1f}s: {source}")
             return cap
+        logger.warning(f"Capture failed after {elapsed:.1f}s: {source}")
         return None
 
     def _apply_privacy(self, sc: StreamConfig, frame: np.ndarray) -> np.ndarray:
@@ -524,20 +573,30 @@ class MultiStreamProcessor:
                     all_xyxy = results[0].boxes.xyxy.cpu().numpy()
                     all_ids = results[0].boxes.id.int().cpu().tolist()
                     # Separate pets (class 1) and bowls (class 3)
-                    boxes, track_ids, bowl_boxes = [], [], []
+                    all_conf = results[0].boxes.conf.cpu()
+                    pet_entries = []  # (conf, xywh, id)
+                    bowl_boxes = []
                     for i, c in enumerate(cls):
                         if int(c) == 1:
-                            boxes.append(all_xywh[i])
-                            track_ids.append(all_ids[i])
+                            pet_entries.append((float(all_conf[i]), all_xywh[i], all_ids[i]))
                         elif int(c) == 3:
                             bowl_boxes.append(all_xyxy[i])
+
+                    # Deduplicate: keep highest confidence per track ID
+                    seen_ids = {}
+                    for conf, xywh, tid in pet_entries:
+                        if tid not in seen_ids or conf > seen_ids[tid][0]:
+                            seen_ids[tid] = (conf, xywh)
+                    boxes = [v[1] for v in seen_ids.values()]
+                    track_ids = list(seen_ids.keys())
+
                     if len(boxes) > 0:
                         boxes = torch.stack(boxes)
                     if len(bowl_boxes) > 0:
                         bowl_boxes = np.array(bowl_boxes)
                     # Don't use results[0].plot() — we draw our own bbox + labels
             elif sc.method == "deepsort":
-                from tracking import track_with_deepsort
+                from tracking import track_with_deepsort  # noqa: root-level module
                 boxes, track_ids, frame = track_with_deepsort(self._model, state.tracker, frame)
                 bowl_boxes = []
             else:
@@ -554,33 +613,44 @@ class MultiStreamProcessor:
         frame: np.ndarray, boxes: list, track_ids: list,
         bowl_boxes: list = None
     ) -> np.ndarray:
-        from detect_fight import detect_fight
-        from detect_inert import detect_inert
-        from detect_sleep import detect_sleep
-        from detect_eat import detect_eat
-        from detect_bathroom import detect_bathroom
-        from detect_active import detect_active
+        from detection import detect_fight, detect_inert, detect_sleep, detect_eat, detect_bathroom, detect_active
 
-        # Prepare coordinates
+        # Map track_ids → behavior_ids (use global_id when available)
+        behavior_ids = []
+        tid_to_bid = {}
         for tid in track_ids:
-            if tid not in state.inert_coor:
-                state.inert_coor[tid] = deque([], maxlen=sc.inert_frames)
-            if tid not in state.sleep_coor:
-                state.sleep_coor[tid] = deque([], maxlen=sc.sleep_frames)
-                state.sleep_bbox[tid] = deque([], maxlen=sc.sleep_frames)
-            if tid not in state.eat_coor:
-                state.eat_coor[tid] = deque([], maxlen=sc.eat_direction_frames * 3)
-            if tid not in state.bathroom_coor:
-                state.bathroom_coor[tid] = deque([], maxlen=sc.bathroom_trigger_frames * 2)
-                state.bathroom_bbox[tid] = deque([], maxlen=sc.bathroom_trigger_frames * 2)
-            if tid not in state.active_coor:
-                state.active_coor[tid] = deque([], maxlen=sc.active_frames)
+            gid = state.global_id_map.get(tid)
+            bid = gid if gid is not None else tid
+            behavior_ids.append(bid)
+            tid_to_bid[tid] = bid
 
-        id_to_idx = {tid: i for i, tid in enumerate(track_ids)}
+        # Resolve display name / event ID: pet_name > global_id > track_id
+        def _resolve_dog_id(bid):
+            """Return the best identifier for API events."""
+            name = state.global_id_names.get(bid)
+            if name:
+                return name
+            return bid
+
+        # Prepare coordinates (keyed by behavior_id)
+        for bid in behavior_ids:
+            if bid not in state.inert_coor:
+                state.inert_coor[bid] = deque([], maxlen=sc.inert_frames)
+            if bid not in state.sleep_coor:
+                state.sleep_coor[bid] = deque([], maxlen=sc.sleep_frames)
+                state.sleep_bbox[bid] = deque([], maxlen=sc.sleep_frames)
+            if bid not in state.eat_coor:
+                state.eat_coor[bid] = deque([], maxlen=sc.eat_direction_frames * 3)
+            if bid not in state.bathroom_coor:
+                state.bathroom_coor[bid] = deque([], maxlen=sc.bathroom_trigger_frames * 2)
+                state.bathroom_bbox[bid] = deque([], maxlen=sc.bathroom_trigger_frames * 2)
+            if bid not in state.active_coor:
+                state.active_coor[bid] = deque([], maxlen=sc.active_frames)
+
         x_centers, y_centers = [], []
         last_w, last_h = 0, 0
 
-        for tid, box in zip(track_ids, boxes):
+        for tid, bid, box in zip(track_ids, behavior_ids, boxes):
             if hasattr(box, 'tolist'):
                 xc, yc, w, h = box.tolist()
             else:
@@ -588,13 +658,13 @@ class MultiStreamProcessor:
             x_centers.append(xc)
             y_centers.append(yc)
             last_w, last_h = int(w), int(h)
-            state.inert_coor[tid].append([xc, yc])
-            state.sleep_coor[tid].append([xc, yc])
-            state.sleep_bbox[tid].append([w, h])
-            state.eat_coor[tid].append([xc, yc])
-            state.bathroom_coor[tid].append([xc, yc])
-            state.bathroom_bbox[tid].append([w, h])
-            state.active_coor[tid].append([xc, yc])
+            state.inert_coor[bid].append([xc, yc])
+            state.sleep_coor[bid].append([xc, yc])
+            state.sleep_bbox[bid].append([w, h])
+            state.eat_coor[bid].append([xc, yc])
+            state.bathroom_coor[bid].append([xc, yc])
+            state.bathroom_bbox[bid].append([w, h])
+            state.active_coor[bid].append([xc, yc])
 
         x_arr = np.array(x_centers)
         y_arr = np.array(y_centers)
@@ -612,14 +682,16 @@ class MultiStreamProcessor:
             "feeding":  (180, 105, 255),   # pink
             "playing":  (0, 165, 255),     # orange
             "inactive": (180, 0, 0),       # dark blue
+            "normal":   (0, 200, 0),       # green
             "none":     (144, 238, 144),   # light green
         }
 
-        # Compute per-dog speeds for fight detection
+        # Compute per-dog speeds for fight detection (use track_ids for fight matrix)
         speeds = {}
         for tid in track_ids:
-            if tid in state.inert_coor and len(state.inert_coor[tid]) >= 2:
-                coor = np.array(state.inert_coor[tid])
+            bid = tid_to_bid[tid]
+            if bid in state.inert_coor and len(state.inert_coor[bid]) >= 2:
+                coor = np.array(state.inert_coor[bid])
                 recent = coor[-min(10, len(coor)):]
                 dists = np.sqrt(np.sum((recent[1:] - recent[:-1]) ** 2, axis=1))
                 speeds[tid] = float(np.mean(dists))
@@ -644,36 +716,40 @@ class MultiStreamProcessor:
             if len(fight_set) > 0:
                 if self._event_sender:
                     for tid in (fight_set - state.prev_fight_ids):
-                        self._event_sender.send({"dogId": tid, "behaviorType": BEHAVIOR_TYPE_MAP["fight"]})
+                        bid = tid_to_bid.get(tid, tid)
+                        self._event_sender.send({"dogId": _resolve_dog_id(bid), "behaviorType": BEHAVIOR_TYPE_MAP["fight"]})
                 stats = self._stats.get_stream_stats(sc.stream_id)
                 if stats:
                     stats.detections["fight"] += len(fight_indices)
             state.prev_fight_ids = fight_set
             for tid in fight_set:
-                dog_behavior[tid] = "fight"
+                bid = tid_to_bid.get(tid, tid)
+                dog_behavior[bid] = "fight"
 
-        # Escape detection
+        # Escape detection (uses track_ids for bbox position check)
         escape_set = set()
         if sc.task_escape and sc.escape_polygon:
-            from detect_escape import detect_escape
+            from detection import detect_escape
             w, h = frame.shape[1], frame.shape[0]
             frame, escaped_ids = detect_escape(
                 boxes, track_ids, frame, state.frame_cnt, sc.escape_polygon, w, h
             )
-            escape_set = set(escaped_ids)
+            # Convert escaped track_ids to behavior_ids
+            escaped_bids = set(tid_to_bid.get(tid, tid) for tid in escaped_ids)
+            escape_set = escaped_bids
             if len(escape_set) > 0:
                 if self._event_sender:
-                    for tid in (escape_set - state.prev_escape_ids):
-                        self._event_sender.send({"dogId": tid, "behaviorType": BEHAVIOR_TYPE_MAP["escape"]})
+                    for bid in (escape_set - state.prev_escape_ids):
+                        self._event_sender.send({"dogId": _resolve_dog_id(bid), "behaviorType": BEHAVIOR_TYPE_MAP["escape"]})
                 stats = self._stats.get_stream_stats(sc.stream_id)
                 if stats:
                     stats.detections["escape"] += len(escaped_ids)
             state.prev_escape_ids = escape_set
-            for tid in escape_set:
-                if tid not in dog_behavior:
-                    dog_behavior[tid] = "escape"
+            for bid in escape_set:
+                if bid not in dog_behavior:
+                    dog_behavior[bid] = "escape"
 
-        # Sleep detection
+        # Sleep detection (state dicts already keyed by behavior_id)
         sleep_set = set()
         if sc.task_sleep:
             sleep_ids = detect_sleep(
@@ -691,17 +767,18 @@ class MultiStreamProcessor:
                 ended = sleep_tracker.update(sleep_ids, state.frame_cnt, sc.target_fps)
                 if len(ended) > 0 and self._event_sender:
                     for ev in ended:
+                        ev["dogId"] = _resolve_dog_id(ev["dogId"])
                         self._event_sender.send(ev)
-            for tid in sleep_set:
-                if tid not in dog_behavior:
-                    dog_behavior[tid] = "sleeping"
+            for bid in sleep_set:
+                if bid not in dog_behavior:
+                    dog_behavior[bid] = "sleeping"
 
         # Bathroom detection
         bathroom_set = set()
         if sc.task_bathroom:
             bathroom_ids = detect_bathroom(
                 state.bathroom_coor, state.bathroom_bbox,
-                boxes, track_ids, frame,
+                boxes, behavior_ids, frame,
                 sc.bathroom_cls_model,
                 sc.bathroom_trigger_frames, sc.bathroom_height_drop,
                 cls_confidence=sc.bathroom_cls_conf,
@@ -709,42 +786,43 @@ class MultiStreamProcessor:
             bathroom_set = set(bathroom_ids)
             if len(bathroom_set) > 0:
                 if self._event_sender:
-                    for tid in (bathroom_set - state.prev_bathroom_ids):
-                        self._event_sender.send({"dogId": tid, "behaviorType": BEHAVIOR_TYPE_MAP["bathroom"]})
+                    for bid in (bathroom_set - state.prev_bathroom_ids):
+                        self._event_sender.send({"dogId": _resolve_dog_id(bid), "behaviorType": BEHAVIOR_TYPE_MAP["bathroom"]})
                 stats = self._stats.get_stream_stats(sc.stream_id)
                 if stats:
                     stats.detections["bathroom"] = stats.detections.get("bathroom", 0) + len(bathroom_ids)
             state.prev_bathroom_ids = bathroom_set
-            for tid in bathroom_set:
-                if tid not in dog_behavior:
-                    dog_behavior[tid] = "bathroom"
+            for bid in bathroom_set:
+                if bid not in dog_behavior:
+                    dog_behavior[bid] = "bathroom"
 
         # Eat detection
         eat_set = set()
         if sc.task_eat:
             eat_ids = detect_eat(
                 state.eat_coor, state.eat_near_count,
-                boxes, track_ids, bowl_boxes or [],
+                boxes, behavior_ids, bowl_boxes or [],
                 sc.eat_iou_threshold, sc.eat_dwell_frames, sc.eat_direction_frames,
             )
             eat_set = set(eat_ids)
             if len(eat_set) > 0:
                 if self._event_sender:
-                    for tid in (eat_set - state.prev_eat_ids):
-                        self._event_sender.send({"dogId": tid, "behaviorType": BEHAVIOR_TYPE_MAP["eat"]})
+                    for bid in (eat_set - state.prev_eat_ids):
+                        self._event_sender.send({"dogId": _resolve_dog_id(bid), "behaviorType": BEHAVIOR_TYPE_MAP["eat"]})
                 stats = self._stats.get_stream_stats(sc.stream_id)
                 if stats:
                     stats.detections["eat"] = stats.detections.get("eat", 0) + len(eat_ids)
             state.prev_eat_ids = eat_set
-            for tid in eat_set:
-                if tid not in dog_behavior:
-                    dog_behavior[tid] = "feeding"
+            for bid in eat_set:
+                if bid not in dog_behavior:
+                    dog_behavior[bid] = "feeding"
 
         # Active detection
         active_set = set()
         if sc.task_active:
             active_ids = detect_active(
                 state.active_coor, sc.active_threshold, sc.active_frames,
+                speed_threshold=sc.active_speed_threshold,
             )
             active_set = set(active_ids)
             if len(active_set) > 0:
@@ -756,10 +834,11 @@ class MultiStreamProcessor:
                 ended = active_tracker.update(active_ids, state.frame_cnt, sc.target_fps)
                 if len(ended) > 0 and self._event_sender:
                     for ev in ended:
+                        ev["dogId"] = _resolve_dog_id(ev["dogId"])
                         self._event_sender.send(ev)
-            for tid in active_set:
-                if tid not in dog_behavior:
-                    dog_behavior[tid] = "playing"
+            for bid in active_set:
+                if bid not in dog_behavior:
+                    dog_behavior[bid] = "playing"
 
         # Inert detection
         inert_set = set()
@@ -768,21 +847,20 @@ class MultiStreamProcessor:
             inert_set = set(inert_ids)
             if len(inert_set) > 0:
                 if self._event_sender:
-                    for tid in (inert_set - state.prev_inert_ids):
-                        self._event_sender.send({"dogId": tid, "behaviorType": BEHAVIOR_TYPE_MAP["inert"]})
+                    for bid in (inert_set - state.prev_inert_ids):
+                        self._event_sender.send({"dogId": _resolve_dog_id(bid), "behaviorType": BEHAVIOR_TYPE_MAP["inert"]})
                 stats = self._stats.get_stream_stats(sc.stream_id)
                 if stats:
                     stats.detections["inert"] += len(inert_ids)
             state.prev_inert_ids = inert_set
-            for tid in inert_set:
-                if tid not in dog_behavior:
-                    dog_behavior[tid] = "inactive"
+            for bid in inert_set:
+                if bid not in dog_behavior:
+                    dog_behavior[bid] = "inactive"
 
         # --- Draw bbox + label per dog (skip "none") ---
         for tid, box in zip(track_ids, boxes):
-            behavior = dog_behavior.get(tid, "none")
-            if behavior == "none":
-                continue
+            bid = tid_to_bid.get(tid, tid)
+            behavior = dog_behavior.get(bid, "normal")
 
             if hasattr(box, 'tolist'):
                 xc, yc, w, h = box.tolist()
@@ -793,14 +871,21 @@ class MultiStreamProcessor:
 
             color = COLOR_MAP.get(behavior, COLOR_MAP["none"])
             gid = state.global_id_map.get(tid)
-            label = f"ID:{tid}/G:{gid} {behavior}" if gid else f"ID:{tid} {behavior}"
+            pet_name = state.global_id_names.get(gid) if gid else None
+            if pet_name:
+                label = f"{pet_name} {behavior}"
+            elif gid is not None:
+                label = f"G:{gid} {behavior}"
+            else:
+                label = f"#{tid} {behavior}"
 
             cv2.rectangle(frame, pt1, pt2, color, 2)
-            # Label background
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-            cv2.rectangle(frame, (pt1[0], pt1[1] - th - 10), (pt1[0] + tw, pt1[1]), color, -1)
-            cv2.putText(frame, label, (pt1[0], pt1[1] - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            if behavior != "normal":
+                # Label background
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                cv2.rectangle(frame, (pt1[0], pt1[1] - th - 10), (pt1[0] + tw, pt1[1]), color, -1)
+                cv2.putText(frame, label, (pt1[0], pt1[1] - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         return frame
 

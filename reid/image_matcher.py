@@ -27,8 +27,8 @@ import click
 from ultralytics import YOLO
 
 # ReID 모듈
-from reid_features import HybridReID, ColorHistogramReID, create_reid_extractor
-from reid_lightweight import AdaptiveReID, FastHistogramReID, create_lightweight_reid
+from reid.extractor import HybridReID, ColorHistogramReID, create_reid_extractor
+from reid.lightweight import AdaptiveReID, FastHistogramReID, create_lightweight_reid
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -293,7 +293,7 @@ class ReIDImageMatcher:
         Returns:
             로드된 reference 이미지 수
         """
-        from pet_profiles import PetProfileStore
+        from tools.pet_profiles import PetProfileStore
         store = PetProfileStore(base_dir)
         refs = store.to_reid_references()
 

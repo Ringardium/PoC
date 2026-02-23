@@ -11,7 +11,7 @@ try:
 except ImportError:
     LIGHTNING_AVAILABLE = False
 
-from lightning_training import YOLOLightningModule
+from models.lightning_training import YOLOLightningModule
 
 
 class LightningYOLOInference:

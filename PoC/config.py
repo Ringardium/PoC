@@ -36,8 +36,9 @@ class StreamConfig:
     bathroom_trigger_frames: int = 30
     bathroom_height_drop: float = 0.25
     bathroom_cls_conf: float = 0.5
-    active_threshold: float = 200.0
-    active_frames: int = 60
+    active_threshold: float = 800.0
+    active_frames: int = 90
+    active_speed_threshold: float = 12.0  # 평균 속도 (px/frame) 이상이어야 active
     reset_frames: int = 20
     flag_frames: int = 40
     priority: int = 1  # 1=highest, 3=lowest

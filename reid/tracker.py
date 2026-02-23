@@ -28,7 +28,7 @@ import time
 
 # 새로운 features 모듈 사용
 try:
-    from features import (
+    from reid.features import (
         FeatureExtractor,
         FeatureConfig,
         FeatureOutput,
@@ -56,12 +56,12 @@ except ImportError:
 
 # 기존 lightweight 모듈 (fallback)
 try:
-    from reid_lightweight import AdaptiveReID, FastHistogramReID, create_lightweight_reid
+    from reid.lightweight import AdaptiveReID, FastHistogramReID, create_lightweight_reid
     LIGHTWEIGHT_AVAILABLE = True
 except ImportError:
     LIGHTWEIGHT_AVAILABLE = False
 
-from global_id_manager import GlobalIDManager
+from reid.global_id import GlobalIDManager
 
 
 @dataclass
@@ -79,6 +79,7 @@ class ReIDTrackerConfig:
     # ID 보정
     correction_enabled: bool = True
     correction_confidence_threshold: float = 0.7
+    correction_cooldown_frames: int = 15  # 보정 후 N프레임 동안 재보정 금지
 
     # 갤러리 관리
     gallery_max_size: int = 10
@@ -227,6 +228,9 @@ class ReIDTracker:
                 feature_dim=self.feature_dim,
                 similarity_threshold=self.config.similarity_threshold
             )
+
+        # 보정 쿨다운: track_id -> 남은 쿨다운 프레임 수
+        self._correction_cooldown: Dict[int, int] = {}
 
         # 통계
         self.stats = {
@@ -399,11 +403,14 @@ class ReIDTracker:
         # 5. 글로벌 ID (선택적)
         if self.config.global_id_enabled and self.global_id_manager:
             global_ids = []
+            used_gids = set()  # Prevent same global_id assigned to multiple objects in one frame
             for track_id, feature, box in zip(corrected_ids, features, boxes):
                 gid = self.global_id_manager.get_global_id(
-                    channel_id, track_id, feature, box
+                    channel_id, track_id, feature, box,
+                    exclude_gids=used_gids,
                 )
                 global_ids.append(gid)
+                used_gids.add(gid)
             result['global_ids'] = global_ids
 
         result['processing_time'] = time.time() - start_time
@@ -502,15 +509,26 @@ class ReIDTracker:
         if len(track_ids) == 0:
             return [], []
 
+        # Tick cooldown counters
+        for tid in list(self._correction_cooldown):
+            self._correction_cooldown[tid] -= 1
+            if self._correction_cooldown[tid] <= 0:
+                del self._correction_cooldown[tid]
+
         corrected_ids = list(track_ids)
         corrections = []
-        current_ids = set(track_ids)
+        # Track both original and already-corrected IDs to prevent duplicates
+        used_ids = set(track_ids)
 
         for i, (track_id, feature, conf) in enumerate(zip(track_ids, features, confidences)):
             if feature is None or len(feature) == 0:
                 continue
 
             if conf < self.config.correction_confidence_threshold:
+                continue
+
+            # Skip if this track is in cooldown (recently corrected)
+            if track_id in self._correction_cooldown:
                 continue
 
             # 기존 트랙과 비교
@@ -521,15 +539,19 @@ class ReIDTracker:
 
                     if similarity < self.config.similarity_threshold:
                         correction = self._try_match_disappeared(
-                            i, track_id, feature, current_ids
+                            i, track_id, feature, used_ids
                         )
                         if correction:
                             corrected_ids[i] = correction['new_id']
+                            used_ids.add(correction['new_id'])
+                            self._correction_cooldown[correction['new_id']] = self.config.correction_cooldown_frames
                             corrections.append(correction)
             else:
-                correction = self._try_reidentify(i, track_id, feature, current_ids)
+                correction = self._try_reidentify(i, track_id, feature, used_ids)
                 if correction:
                     corrected_ids[i] = correction['new_id']
+                    used_ids.add(correction['new_id'])
+                    self._correction_cooldown[correction['new_id']] = self.config.correction_cooldown_frames
                     corrections.append(correction)
 
         return corrected_ids, corrections

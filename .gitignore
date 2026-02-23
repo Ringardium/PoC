@@ -31,3 +31,5 @@ Thumbs.db
 *.png
 *.jpg
 *.jpeg
+# Keep emoji assets
+!assets/emoji/*.png

@@ -2,300 +2,138 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Project Structure
+
+```
+├── main.py                  # 싱글 스트림 CLI (Click)
+├── tracking.py              # ByteTrack / BotSORT / DeepSORT 트래커
+├── bytetrack.yaml           # ByteTrack 설정
+├── botsort.yaml             # BotSORT 설정
+│
+├── detection/               # 행동 감지 모듈
+│   ├── fight.py             # 싸움 감지 (IoU + proximity)
+│   ├── inert.py             # 비활동 감지 (displacement)
+│   ├── sleep.py             # 수면 감지 (aspect ratio + stability)
+│   ├── eat.py               # 식사 감지 (bowl overlap + direction)
+│   ├── bathroom.py          # 배변 감지 (height drop + classify)
+│   ├── active.py            # 활동 감지 (high displacement)
+│   ├── escape.py            # 탈출 감지 (polygon ROI)
+│   └── utils.py             # IoU 유틸리티
+│
+├── reid/                    # Re-ID 시스템
+│   ├── tracker.py           # ReIDTracker (ID 보정 + 글로벌 ID)
+│   ├── image_matcher.py     # 레퍼런스 이미지 매칭 CLI
+│   ├── extractor.py         # GPU 특징 추출 (OSNet, Histogram)
+│   ├── lightweight.py       # CPU 특징 추출 (FastHistogram, MobileNet)
+│   ├── global_id.py         # 크로스 스트림 글로벌 ID
+│   └── features/            # 플러그인 특징 프레임워크
+│       ├── base.py, appearance.py, motion.py
+│       ├── behavior.py, fusion.py, matching.py, events.py
+│
+├── models/                  # 모델 관리/최적화
+│   ├── cli.py               # 모델 변환 CLI (export, prune, quantize)
+│   ├── converter.py         # 포맷 변환 (TorchScript, ONNX, CoreML)
+│   ├── optimization.py      # 최적화 (pruning, quantization)
+│   ├── lightning_training.py # PyTorch Lightning 학습
+│   └── lightning_inference.py
+│
+├── tools/                   # 유틸리티
+│   ├── privacy_filter.py    # 프라이버시 필터 (blur/mosaic/black)
+│   ├── pet_profiles.py      # 펫 프로필 CRUD (JSON)
+│   ├── coord_picker.py      # ROI 좌표 선택기
+│   └── generate_emoji.py    # 이모지 PNG 생성
+│
+├── deep_sort/               # DeepSORT 구현
+├── assets/                  # 정적 에셋
+│   ├── emoji/               # 행동 이모지 PNG
+│   └── fonts/               # 폰트 파일
+│
+├── PoC/                     # 멀티스트림 서버 시스템
+│   ├── main.py              # 서버 CLI
+│   ├── stream_processor.py  # 비동기 멀티스트림 처리
+│   ├── config.py            # SystemConfig / StreamConfig
+│   ├── web_server.py        # FastAPI + WebSocket
+│   ├── monitor.py           # 실시간 성능 모니터링
+│   ├── event_sender.py      # 행동 이벤트 API
+│   ├── hls_uploader.py      # HLS → S3 업로드
+│   └── templates/           # 웹 UI
+│
+└── legacy/                  # Deprecated 파일
+```
+
 ## Common Development Commands
 
-**Running the application:**
 ```bash
-python main.py --method [bytetrack|botsort|deepsort] --input <video_file> --output <output_file> [options]
+# 싱글 스트림 추적 + 행동 감지
+python main.py --method bytetrack --input video.mp4 --output result.mp4 --task-fight --task-sleep --task-eat
+
+# 프라이버시 필터 포함
+python main.py --method bytetrack --input video.mp4 --output result.mp4 --task-fight --privacy --privacy-method blur
+
+# 멀티스트림 서버 실행
+cd PoC && python main.py run --config sample_config.json
+
+# 모델 최적화
+python -m models.cli mobile export --model weights/best.pt --format torchscript --half
+
+# 이모지 PNG 생성
+python tools/generate_emoji.py
+
+# 프라이버시 필터 독립 실행
+python tools/privacy_filter.py --input video.mp4 --output output.mp4 --method blur
 ```
 
-**Installing dependencies:**
-```bash
-pip install -r requirements.in
+## Architecture
+
+### 트래킹 파이프라인
+```
+프레임 → 프라이버시 필터 → YOLO 감지/추적 → ReID 보정 → 행동 분석 → 시각화
 ```
 
-**Example usage:**
-```bash
-# Basic tracking with fight detection
-python main.py --method bytetrack --input play.mp4 --output output.mp4 --task-fight
+### 핵심 규칙
+- Pet class ID = `1`, Bowl class ID = `3`
+- `task_eat=True` → yolo_classes에 class 3 자동 추가
+- 모든 행동 감지 모듈은 독립적 (cross-import 없음)
+- tracking.py의 3개 트래커는 동일 인터페이스 반환: `(boxes, track_ids, frame)`
 
-# Multiple behavior detection
-python main.py --method botsort --input video.mp4 --output result.mp4 --task-fight --task-escape --task-inert
+## Import 패턴
 
-# Custom thresholds
-python main.py --method deepsort --input input.mp4 --output output.mp4 --task-fight --threshold 0.15 --inert-threshold 30
+```python
+# 행동 감지
+from detection import detect_fight, detect_sleep, detect_eat
 
-# Sleep detection
-python main.py --method bytetrack --input video.mp4 --output result.mp4 --task-sleep --sleep-threshold 20 --sleep-frames 300
+# ReID
+from reid import ReIDTracker
 
-# Eat detection (requires bowl class 3 in YOLO model)
-python main.py --method bytetrack --input video.mp4 --output result.mp4 --task-eat --eat-iou-threshold 0.3 --eat-dwell-frames 30
-
-# Bathroom detection (requires trained YOLO classify model)
-python main.py --method bytetrack --input video.mp4 --output result.mp4 --task-bathroom --bathroom-cls-model weights/bathroom_cls.pt
-
-# All behaviors at once
-python main.py --method bytetrack --input video.mp4 --output result.mp4 --task-fight --task-inert --task-sleep --task-eat --task-bathroom
+# 유틸리티
+from tools import apply_blur, apply_mosaic, apply_black_box
+from tools.pet_profiles import PetProfileStore
 ```
 
-## Architecture Overview
+## Behavior Detection Reference
 
-This is a pet behavior tracking and analysis system using computer vision and object tracking algorithms. The system processes video files to detect and track pets, then analyzes their behavior patterns.
+| Module | File | Detection Logic |
+|--------|------|----------------|
+| Fight | `detection/fight.py` | Pairwise IoU + sustained proximity counting |
+| Inert | `detection/inert.py` | Displacement < threshold over N frames |
+| Sleep | `detection/sleep.py` | Low displacement + aspect ratio + area stability |
+| Eat | `detection/eat.py` | Bowl overlap + movement direction + dwell time |
+| Bathroom | `detection/bathroom.py` | Height drop trigger → YOLO classify confirm |
+| Active | `detection/active.py` | High displacement over sustained period |
+| Escape | `detection/escape.py` | Point-in-polygon ROI check |
 
-**Core Components:**
+## Pet Profile Storage
 
-1. **main.py** - Entry point with CLI interface using Click. Orchestrates the entire pipeline from video input to processed output with detected behaviors.
-
-2. **tracking.py** - Contains three tracking implementations:
-   - `track_with_bytetrack()` - ByteTrack algorithm implementation
-   - `track_with_botsort()` - BoT-SORT algorithm implementation
-   - `track_with_deepsort()` - DeepSORT algorithm implementation
-   All use YOLO for object detection (class 1 = pets) with configurable confidence/IoU thresholds.
-
-3. **Behavior Detection Modules:**
-   - **detect_fight.py** - Detects aggressive interactions between pets using pairwise IoU and sustained proximity counting
-   - **detect_escape2.py** - Detects when pets leave a user-defined polygon ROI area (point-in-polygon)
-   - **detect_inert.py** - Detects when pets remain stationary for extended periods (displacement threshold)
-   - **detect_sleep.py** - Detects sleeping behavior: low displacement + bbox aspect ratio ≥ 1.2 (lying posture) + stable bbox area (CV ≤ 0.15)
-   - **detect_eat.py** - Detects eating behavior using bowl (YOLO class 3) interaction: bowl-relative overlap (intersection/bowl_area), movement direction toward bowl (cosine similarity), and dwell time
-   - **detect_bathroom.py** - Detects bathroom behavior with 2-phase pipeline: rule-based trigger (bbox height drop ≥ 25% + stationary) → YOLO classify model for confirmation
-
-4. **deep_sort/** - Complete DeepSORT implementation with Kalman filtering, Hungarian assignment, and appearance descriptors for robust tracking.
-
-**Key Architecture Patterns:**
-
-- **Modular behavior detection**: Each behavior (fight, escape, inert, sleep, eat, bathroom) is implemented as a separate module with its own detection logic
-- **Tracker abstraction**: All three tracking methods return the same interface (boxes, track_ids, frame)
-- **State management**: Uses deques for coordinate history, torch tensors for interaction counting, and configurable frame buffers
-- **Video processing pipeline**: Reads frames → detect/track objects → analyze behaviors → annotate frame → save output
-
-**Configuration:**
-- Tracker parameters are defined in `bytetrack.yaml` and `botsort.yaml`
-- Model weights available in `weights/` directory (modelv11x.pt, modelv9e.pt)
-- Default model path: `weights/best.pt` (configurable via --model parameter)
-- All thresholds and frame counts are configurable via CLI parameters
-
-## Multi-Stream Processing
-
-**New parallel processing system for handling multiple video streams:**
-
-**Running multi-stream processing:**
-```bash
-# From JSON config file
-python main_multi.py run-config --config multi_stream_config.json
-
-# Direct CLI with multiple streams
-python main_multi.py run-streams --streams "video1.mp4,video2.mp4,0" --outputs "out1.mp4,out2.mp4,webcam.mp4"
-
-# RTSP streams
-python main_multi.py rtsp --rtsp-urls "rtsp://camera1,rtsp://camera2"
-
-# Create sample config
-python main_multi.py create-config
 ```
-
-**Key Features:**
-- **Async Processing**: Uses asyncio for concurrent stream handling
-- **Batch Inference**: Optimizes GPU usage by processing multiple frames together
-- **Memory Management**: Efficient frame buffering with compression
-- **Resource Monitoring**: Real-time CPU/GPU/memory usage tracking
-- **Auto-scaling**: Adaptive frame skipping based on system load
-- **Real-time Support**: RTSP streams and webcam input
-
-**Performance Optimizations:**
-- `optimized_tracking.py` - Batch processing, memory management, adaptive frame skipping
-- `multi_stream_processor.py` - Async architecture with thread pool execution
-- GPU memory optimization with half-precision inference
-- Compressed frame buffering to reduce memory usage
-
-## Model Conversion and Optimization
-
-**PyTorch Mobile Export (No TensorFlow dependency required):**
-```bash
-# Export to TorchScript for PyTorch Mobile/ExecuTorch
-python model_cli.py mobile export --model weights/modelv11x.pt --format torchscript --half
-
-# Export to ONNX for cross-platform mobile with INT8 quantization
-python model_cli.py mobile export --model weights/modelv11x.pt --format onnx --optimize --int8
-
-# Export to CoreML for iOS
-python model_cli.py mobile export --model weights/modelv11x.pt --format coreml
-
-# Apply pruning to reduce model size (50% sparsity)
-python model_cli.py mobile prune --model weights/modelv11x.pt --sparsity 0.5
-
-# Apply post-training quantization with calibration data
-python model_cli.py mobile quantize --model weights/modelv11x.pt --calibration-data ./calibration_images
-
-# Auto-optimize for mobile with size constraints
-python model_cli.py mobile optimize --model weights/modelv11x.pt --target-size-mb 30
-
-# Benchmark mobile model performance
-python model_cli.py mobile benchmark --model model.pt --image test.jpg --format torchscript
-```
-
-**PyTorch Lightning Training:**
-```bash
-# Train with Lightning
-python model_cli.py lightning train --data data.yaml --epochs 100 --batch-size 16
-
-# Inference with Lightning model
-python model_cli.py lightning infer --checkpoint model.ckpt --image test.jpg --output result.jpg
-
-# Benchmark Lightning model
-python model_cli.py lightning benchmark-lightning --checkpoint model.ckpt --test-images ./test_images
-```
-
-**Model Information:**
-```bash
-# Get model details
-python model_cli.py info --model weights/best.pt
-```
-
-**Key Model Features:**
-- **PyTorch Mobile/ExecuTorch**: TorchScript export optimized for mobile deployment
-- **ONNX Export**: Cross-platform compatibility with ONNX Runtime Mobile
-- **CoreML**: iOS-optimized models for Apple devices
-- **Pruning**: Magnitude-based unstructured pruning for model compression
-- **Quantization**: Post-training quantization (PTQ) with INT8/FP16 support
-- **PyTorch Lightning**: Advanced training with callbacks, logging, and distributed training
-- **Auto-Optimization**: Automatically find best mobile model within size constraints
-- **Performance Benchmarking**: Compare different mobile model formats
-
-**Supported Model Formats:**
-- Original YOLO (.pt)
-- TorchScript (.pt) - PyTorch Mobile/ExecuTorch
-- ONNX (.onnx) - Cross-platform mobile
-- CoreML (.mlpackage) - iOS optimized
-- PyTorch Lightning (.ckpt) - Advanced training
-
-## Development Workflow
-
-**Testing the system:**
-```bash
-# Quick functionality test with sample video
-python main.py --method bytetrack --input test_video.mp4 --output test_output.mp4 --task-fight
-
-# Test multi-stream processing
-python main_multi.py create-config
-python main_multi.py run-config --config multi_stream_config.json
-
-# Test mobile model export pipeline
-python model_cli.py info --model weights/modelv11x.pt
-python model_cli.py mobile export --model weights/modelv11x.pt --format torchscript
-```
-
-**Key Dependencies and Setup:**
-- Python packages listed in `requirements.in`
-- YOLO models in `weights/` directory
-- Compatible with CUDA for GPU acceleration
-- OpenCV for video processing, PyTorch for deep learning
-
-**Important Notes:**
-- Pet class ID is hardcoded as `1` in all tracking methods
-- Bowl class ID is `3` (used by detect_eat for bowl detection)
-- Video output uses H.264 encoding via PyAV library
-- Interactive polygon selection required for escape detection
-- All behavior detection modules are optional and can be enabled via CLI flags
-- detect_eat requires bowl (class 3) to be in the YOLO detection model
-- detect_bathroom requires a separate YOLO classify model (`weights/bathroom_cls.pt`)
-
-## Behavior Detection Module Reference
-
-| Module | File | Method | Detection Logic | Additional Model |
-|--------|------|--------|----------------|-----------------|
-| Fight | `detect_fight.py` | Rule-based | Pairwise IoU + sustained proximity counting | None |
-| Escape | `detect_escape2.py` | Rule-based | Point-in-polygon ROI check | None |
-| Inert | `detect_inert.py` | Rule-based | Displacement < threshold over N frames | None |
-| Sleep | `detect_sleep.py` | Rule-based | Displacement + bbox aspect ratio (lying) + area stability (CV) | None |
-| Eat | `detect_eat.py` | Rule + YOLO detect | Bowl overlap (intersection/bowl_area) + movement direction (cosine) + dwell time | Bowl detection (class 3) |
-| Bathroom | `detect_bathroom.py` | Rule trigger + YOLO classify | Phase 1: bbox height drop + stationary → Phase 2: crop + classify | YOLO classify model |
-
-**CLI flags for each module:**
-- `--task-fight` / `--threshold`, `--reset-frames`, `--flag-frames`
-- `--task-escape`
-- `--task-inert` / `--inert-threshold`, `--inert-frames`
-- `--task-sleep` / `--sleep-threshold`, `--sleep-frames`, `--sleep-aspect-ratio`, `--sleep-area-stability`
-- `--task-eat` / `--eat-iou-threshold`, `--eat-dwell-frames`, `--eat-direction-frames`, `--bowl-conf`
-- `--task-bathroom` / `--bathroom-cls-model`, `--bathroom-trigger-frames`, `--bathroom-height-drop`, `--bathroom-cls-conf`
-- `--privacy` / `--privacy-method` (blur|mosaic|black), `--privacy-model`
-
-## Privacy Filter
-
-사람을 자동 감지하여 프라이버시를 보호하는 필터. 독립 CLI 또는 main.py 통합 사용 가능.
-
-**독립 실행:**
-```bash
-python privacy_filter.py --input video.mp4 --output output.mp4 --method blur
-python privacy_filter.py --input video.mp4 --output output.mp4 --method mosaic --mosaic-size 30
-```
-
-**main.py 파이프라인 통합:**
-```bash
-# 펫 트래킹 + 사람 블러 처리
-python main.py --method bytetrack --input video.mp4 --output result.mp4 --task-fight --privacy
-python main.py --method bytetrack --input video.mp4 --output result.mp4 --privacy --privacy-method mosaic
-```
-
-## Emoji Rendering
-
-행동 감지 시 bbox 옆에 이모지를 표시. `emoji/` 디렉토리에 PNG 파일 필요.
-
-```bash
-# 이모지 PNG 생성 (최초 1회)
-python generate_emoji.py
-
-# emoji/ 폴더가 있으면 main.py 실행 시 자동 로드
-```
-
-생성되는 파일: fight.png (🥊), escape.png (⚠️), inert.png (❄️), play.png (🎾), sleep.png (😴), eat.png (🍽️), bathroom.png (🚽)
-
-## ReID / Global ID Module Reference
-
-**Re-Identification 및 글로벌 ID 관리 모듈 구조:**
-
-| 모듈 | 파일 | 역할 |
-|------|------|------|
-| ReID Tracker | `reid_tracker.py` | ID 보정 + 글로벌 ID 파이프라인 (main.py에서 사용) |
-| Global ID Manager | `global_id_manager.py` | 크로스 채널/스트림 글로벌 ID 매핑 |
-| ReID Features (GPU) | `reid_features.py` | OSNet, EfficientNet, Histogram 기반 특징 추출 |
-| ReID Lightweight (CPU) | `reid_lightweight.py` | FastHistogram, MobileNetV3, Adaptive 특징 추출 |
-| ReID Image Matcher | `reid_image_matcher.py` | 레퍼런스 이미지 기반 펫 식별 CLI 도구 |
-| Feature Framework | `features/` | 플러그인 방식 특징 추출/융합/매칭 프레임워크 |
-| Pet Profile Store | `pet_profiles.py` | JSON 기반 펫 프로필(이름, 이미지, 정보) CRUD |
-
-**펫 프로필 저장소 (`pet_profiles.py`):**
-```bash
-# 펫 프로필은 references/ 디렉토리에 저장
 references/
-├── pets.json           # 펫 메타데이터 (이름, 종, 정보)
-└── images/             # 레퍼런스 이미지
-    ├── poppi_001.jpg
-    └── mimi_001.jpg
+├── pets.json         # 펫 프로필 데이터
+└── images/           # 레퍼런스 이미지
 ```
 
 ```python
-from pet_profiles import PetProfileStore
-
+from tools.pet_profiles import PetProfileStore
 store = PetProfileStore("references")
-gid = store.add_pet(name="뽀삐", species="dog", breed="골든 리트리버")
-store.add_reference_image(gid, "path/to/poppi.jpg")
+gid = store.add_pet(name="뽀삐", species="dog")
+store.add_reference_image(gid, "photo.jpg")
 store.save()
-
-# ReID Image Matcher와 연동
-refs = store.to_reid_references()  # reid_image_matcher 호환 형식
-name_map = store.get_name_map()    # {global_id: name} 매핑
 ```
-
-**ReID CLI 옵션:**
-- `--use-reid` / `--reid-method` (adaptive|histogram|mobilenet), `--reid-threshold`
-- `--reid-global-id` — 글로벌 ID 파이프라인 활성화
-
-**Features 프레임워크 (`features/`):**
-- `base.py` — FeatureExtractor ABC, TrackContext, FeatureOutput
-- `appearance.py` — Histogram, MobileNet, Adaptive, ColorLayout 추출기
-- `motion.py` — Motion, OpticalFlow, Trajectory 추출기
-- `behavior.py` — Activity, Posture, Interaction, BehaviorPattern 추출기
-- `fusion.py` — WeightedConcat, Attention, Adaptive 융합 전략
-- `matching.py` — Cosine, Euclidean, Cascade, Greedy 매칭 전략
-- `events.py` — TrackEventBus, IDSwitchHandler, OcclusionHandler

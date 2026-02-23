@@ -13,19 +13,15 @@ from ultralytics import YOLO
 
 from deep_sort import nn_matching
 from deep_sort.tracker import Tracker
-from detect_escape2 import detect_escape, polygon_selector
-from detect_fight import detect_fight
-from detect_inert import detect_inert
-from detect_sleep import detect_sleep
-from detect_eat import detect_eat
-from detect_bathroom import detect_bathroom
+from detection import detect_fight, detect_inert, detect_sleep, detect_eat, detect_bathroom
+from detection import detect_escape, polygon_selector
 from tracking import (
     track_with_botsort,
     track_with_bytetrack,
     track_with_deepsort,
 )
-from reid_tracker import ReIDTracker
-from privacy_filter import apply_blur, apply_mosaic, apply_black_box
+from reid import ReIDTracker
+from tools import apply_blur, apply_mosaic, apply_black_box
 
 
 # ============================================================================
@@ -226,7 +222,7 @@ def load_emoji_images(emoji_dir: str = None, size: int = 32) -> dict:
 
     if emoji_dir is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        emoji_dir = os.path.join(script_dir, "emoji")
+        emoji_dir = os.path.join(script_dir, "assets", "emoji")
 
     emoji_images = {}
 

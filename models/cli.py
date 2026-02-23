@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import List, Optional
 
 from ultralytics import YOLO
-from lightning_training import LightningTrainer, quick_train_setup
-from lightning_inference import LightningYOLOInference
+from models.lightning_training import LightningTrainer, quick_train_setup
+from models.lightning_inference import LightningYOLOInference
 
 
 @click.group()

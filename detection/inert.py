@@ -18,7 +18,7 @@ def detect_inert(
 
     for i, id in enumerate(inert_coor.keys()):
         coor = np.array(inert_coor[id])
-        distances = np.sum((coor[1:] - coor[:-1]) ** 2, axis=1)
+        distances = np.sqrt(np.sum((coor[1:] - coor[:-1]) ** 2, axis=1))
         displacement = np.sum(distances)
 
         if len(coor) < inert_frames:
