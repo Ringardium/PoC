@@ -218,3 +218,84 @@ python model_cli.py mobile export --model weights/modelv11x.pt --format torchscr
 - `--task-sleep` / `--sleep-threshold`, `--sleep-frames`, `--sleep-aspect-ratio`, `--sleep-area-stability`
 - `--task-eat` / `--eat-iou-threshold`, `--eat-dwell-frames`, `--eat-direction-frames`, `--bowl-conf`
 - `--task-bathroom` / `--bathroom-cls-model`, `--bathroom-trigger-frames`, `--bathroom-height-drop`, `--bathroom-cls-conf`
+- `--privacy` / `--privacy-method` (blur|mosaic|black), `--privacy-model`
+
+## Privacy Filter
+
+사람을 자동 감지하여 프라이버시를 보호하는 필터. 독립 CLI 또는 main.py 통합 사용 가능.
+
+**독립 실행:**
+```bash
+python privacy_filter.py --input video.mp4 --output output.mp4 --method blur
+python privacy_filter.py --input video.mp4 --output output.mp4 --method mosaic --mosaic-size 30
+```
+
+**main.py 파이프라인 통합:**
+```bash
+# 펫 트래킹 + 사람 블러 처리
+python main.py --method bytetrack --input video.mp4 --output result.mp4 --task-fight --privacy
+python main.py --method bytetrack --input video.mp4 --output result.mp4 --privacy --privacy-method mosaic
+```
+
+## Emoji Rendering
+
+행동 감지 시 bbox 옆에 이모지를 표시. `emoji/` 디렉토리에 PNG 파일 필요.
+
+```bash
+# 이모지 PNG 생성 (최초 1회)
+python generate_emoji.py
+
+# emoji/ 폴더가 있으면 main.py 실행 시 자동 로드
+```
+
+생성되는 파일: fight.png (🥊), escape.png (⚠️), inert.png (❄️), play.png (🎾), sleep.png (😴), eat.png (🍽️), bathroom.png (🚽)
+
+## ReID / Global ID Module Reference
+
+**Re-Identification 및 글로벌 ID 관리 모듈 구조:**
+
+| 모듈 | 파일 | 역할 |
+|------|------|------|
+| ReID Tracker | `reid_tracker.py` | ID 보정 + 글로벌 ID 파이프라인 (main.py에서 사용) |
+| Global ID Manager | `global_id_manager.py` | 크로스 채널/스트림 글로벌 ID 매핑 |
+| ReID Features (GPU) | `reid_features.py` | OSNet, EfficientNet, Histogram 기반 특징 추출 |
+| ReID Lightweight (CPU) | `reid_lightweight.py` | FastHistogram, MobileNetV3, Adaptive 특징 추출 |
+| ReID Image Matcher | `reid_image_matcher.py` | 레퍼런스 이미지 기반 펫 식별 CLI 도구 |
+| Feature Framework | `features/` | 플러그인 방식 특징 추출/융합/매칭 프레임워크 |
+| Pet Profile Store | `pet_profiles.py` | JSON 기반 펫 프로필(이름, 이미지, 정보) CRUD |
+
+**펫 프로필 저장소 (`pet_profiles.py`):**
+```bash
+# 펫 프로필은 references/ 디렉토리에 저장
+references/
+├── pets.json           # 펫 메타데이터 (이름, 종, 정보)
+└── images/             # 레퍼런스 이미지
+    ├── poppi_001.jpg
+    └── mimi_001.jpg
+```
+
+```python
+from pet_profiles import PetProfileStore
+
+store = PetProfileStore("references")
+gid = store.add_pet(name="뽀삐", species="dog", breed="골든 리트리버")
+store.add_reference_image(gid, "path/to/poppi.jpg")
+store.save()
+
+# ReID Image Matcher와 연동
+refs = store.to_reid_references()  # reid_image_matcher 호환 형식
+name_map = store.get_name_map()    # {global_id: name} 매핑
+```
+
+**ReID CLI 옵션:**
+- `--use-reid` / `--reid-method` (adaptive|histogram|mobilenet), `--reid-threshold`
+- `--reid-global-id` — 글로벌 ID 파이프라인 활성화
+
+**Features 프레임워크 (`features/`):**
+- `base.py` — FeatureExtractor ABC, TrackContext, FeatureOutput
+- `appearance.py` — Histogram, MobileNet, Adaptive, ColorLayout 추출기
+- `motion.py` — Motion, OpticalFlow, Trajectory 추출기
+- `behavior.py` — Activity, Posture, Interaction, BehaviorPattern 추출기
+- `fusion.py` — WeightedConcat, Attention, Adaptive 융합 전략
+- `matching.py` — Cosine, Euclidean, Cascade, Greedy 매칭 전략
+- `events.py` — TrackEventBus, IDSwitchHandler, OcclusionHandler

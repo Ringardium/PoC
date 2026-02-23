@@ -283,15 +283,49 @@ class ReIDImageMatcher:
 
         return representative.astype(np.float32)
 
+    def load_from_pet_profiles(self, base_dir: str = "references") -> int:
+        """
+        PetProfileStore에서 reference 로드
+
+        Args:
+            base_dir: PetProfileStore 기본 디렉토리
+
+        Returns:
+            로드된 reference 이미지 수
+        """
+        from pet_profiles import PetProfileStore
+        store = PetProfileStore(base_dir)
+        refs = store.to_reid_references()
+
+        # pets.json이 있는 디렉토리를 base_dir로 사용
+        return self._load_references_list(refs.get('references', []), Path(base_dir))
+
     def _load_from_json(self, json_path: Path) -> int:
-        """JSON 파일에서 reference 정보 로드"""
+        """JSON 파일에서 reference 정보 로드 (references 형식 및 pets.json 형식 호환)"""
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        loaded_count = 0
         base_dir = json_path.parent
 
-        for item in data.get('references', []):
+        # pets.json 형식 (version + pets 키) -> references 형식으로 변환
+        if 'pets' in data and 'references' not in data:
+            items = []
+            for pet in data['pets']:
+                for img_path in pet.get('reference_images', []):
+                    items.append({
+                        'name': pet.get('name', f"pet_{pet.get('global_id', 0)}"),
+                        'image_path': img_path,
+                        'global_id': pet.get('global_id'),
+                    })
+            return self._load_references_list(items, base_dir)
+
+        return self._load_references_list(data.get('references', []), base_dir)
+
+    def _load_references_list(self, items: list, base_dir: Path) -> int:
+        """reference 항목 리스트에서 갤러리 로드 (내부 공통 메서드)"""
+        loaded_count = 0
+
+        for item in items:
             try:
                 img_path = base_dir / item['image_path']
                 image = cv2.imread(str(img_path))
@@ -355,6 +389,9 @@ class ReIDImageMatcher:
 
             except Exception as e:
                 logger.error(f"Reference 항목 처리 실패: {e}")
+
+        logger.info(f"총 {loaded_count}개의 reference 로드 완료")
+        return loaded_count
 
     def compute_similarity(self, feat1: np.ndarray, feat2: np.ndarray) -> float:
         """코사인 유사도 계산"""

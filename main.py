@@ -25,6 +25,7 @@ from tracking import (
     track_with_deepsort,
 )
 from reid_tracker import ReIDTracker
+from privacy_filter import apply_blur, apply_mosaic, apply_black_box
 
 
 # ============================================================================
@@ -576,6 +577,9 @@ def annotate_frame_with_supervision(
 @click.option("--reid-method", default="adaptive", type=click.Choice(["adaptive", "histogram", "mobilenet"]), help="ReID 방식 선택")
 @click.option("--reid-threshold", default=0.5, help="ReID 동일 객체 판단 유사도 임계값")
 @click.option("--reid-global-id", is_flag=True, help="ReID 글로벌 ID 할당 활성화 (full pipeline)")
+@click.option("--privacy", is_flag=True, help="사람 감지 후 프라이버시 필터 적용")
+@click.option("--privacy-method", type=click.Choice(["blur", "mosaic", "black"]), default="blur", help="프라이버시 필터 방식")
+@click.option("--privacy-model", default="yolo11n.pt", help="사람 감지용 YOLO 모델 경로")
 def main(
     model,
     method,
@@ -609,6 +613,9 @@ def main(
     reid_method,
     reid_threshold,
     reid_global_id,
+    privacy,
+    privacy_method,
+    privacy_model,
 ):
     model = YOLO(model)
     cap = cv2.VideoCapture(input)
@@ -635,6 +642,14 @@ def main(
         )
         mode = "full pipeline (ID 보정 + 글로벌 ID)" if reid_global_id else "경량 (ID 보정)"
         print(f"[INFO] ReID 활성화 - mode: {mode}, method: {reid_method}, threshold: {reid_threshold}")
+
+    # ========================================================================
+    # 프라이버시 필터 초기화
+    # ========================================================================
+    privacy_yolo = None
+    if privacy:
+        privacy_yolo = YOLO(privacy_model)
+        print(f"[INFO] 프라이버시 필터 활성화 - method: {privacy_method}, model: {privacy_model}")
 
     # ========================================================================
     # Supervision Annotator 설정 (하드코딩 CONFIG 사용)
@@ -683,6 +698,22 @@ def main(
 
         if success:
             frame_cnt += 1
+
+            # 프라이버시 필터 적용 (사람 감지 → 블러/모자이크/블랙박스)
+            if privacy_yolo is not None:
+                person_results = privacy_yolo(frame, conf=0.5, classes=[0], verbose=False)
+                if len(person_results[0].boxes) > 0:
+                    person_boxes = person_results[0].boxes.xyxy.cpu().numpy().astype(int)
+                    for pb in person_boxes:
+                        px1, py1, px2, py2 = pb
+                        px1, py1 = max(0, px1 - 10), max(0, py1 - 10)
+                        px2, py2 = min(w, px2 + 10), min(h, py2 + 10)
+                        if privacy_method == "blur":
+                            frame = apply_blur(frame, px1, py1, px2, py2)
+                        elif privacy_method == "mosaic":
+                            frame = apply_mosaic(frame, px1, py1, px2, py2)
+                        elif privacy_method == "black":
+                            frame = apply_black_box(frame, px1, py1, px2, py2)
 
             if method == "bytetrack":
                 boxes, track_ids, frame = track_with_bytetrack(model, frame)

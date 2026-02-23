@@ -11,27 +11,40 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# Map internal behavior names to backend API spec
+BEHAVIOR_TYPE_MAP = {
+    "sleep": "sleeping",
+    "inert": "inactive",
+    "eat": "feeding",
+    "active": "playing",
+    "fight": "fight",
+    "escape": "escape",
+    "bathroom": "bathroom",
+}
 
-class SleepStateTracker:
-    """Track per-dog sleep state transitions (start/end).
 
-    Each frame, call ``update()`` with the current list of sleeping track IDs.
-    When a dog stops sleeping, the tracker yields a completed event with duration.
+class BehaviorStateTracker:
+    """Track per-dog behavior state transitions (start/end) with duration.
+
+    Each frame, call ``update()`` with the current list of detected track IDs.
+    When a dog stops the behavior, the tracker yields a completed event with duration.
     """
 
-    def __init__(self):
+    def __init__(self, behavior: str, min_duration_min: float = 1.0):
+        self._behavior = behavior
+        self._min_duration_min = min_duration_min
         # track_id -> {"start_time": float, "start_frame": int}
         self._active: Dict[int, dict] = {}
 
-    def update(self, sleep_ids: List[int], frame_cnt: int, fps: int) -> List[dict]:
-        """Compare current sleep_ids against active states.
+    def update(self, detected_ids: List[int], frame_cnt: int, fps: int) -> List[dict]:
+        """Compare current detected_ids against active states.
 
-        Returns list of completed sleep events (dogs that just woke up).
+        Returns list of completed events (dogs that stopped the behavior).
         """
-        current_set = set(sleep_ids)
+        current_set = set(detected_ids)
         ended_events: List[dict] = []
 
-        # Detect newly sleeping dogs
+        # Detect newly started dogs
         for tid in current_set:
             if tid not in self._active:
                 self._active[tid] = {
@@ -39,7 +52,7 @@ class SleepStateTracker:
                     "start_frame": frame_cnt,
                 }
 
-        # Detect dogs that stopped sleeping
+        # Detect dogs that stopped
         finished = [tid for tid in self._active if tid not in current_set]
         now = time.time()
 
@@ -48,17 +61,27 @@ class SleepStateTracker:
             duration_sec = now - state["start_time"]
             duration_min = round(duration_sec / 60, 2)
 
+            if duration_min < self._min_duration_min:
+                logger.debug(
+                    f"{self._behavior} too short, skipping: dog {tid}, {duration_min:.2f}min"
+                )
+                continue
+
             ended_events.append({
-                "dogID": tid,
-                "behaviorType": "sleep",
+                "dogId": tid,
+                "behaviorType": BEHAVIOR_TYPE_MAP[self._behavior],
                 "durationMinutes": duration_min,
             })
             logger.info(
-                f"Sleep ended: dog {tid}, duration {duration_min:.2f}min "
+                f"{self._behavior} ended: dog {tid}, duration {duration_min:.2f}min "
                 f"(frames {state['start_frame']}-{frame_cnt})"
             )
 
         return ended_events
+
+
+# Backward compatibility
+SleepStateTracker = BehaviorStateTracker
 
 
 class EventSender:
