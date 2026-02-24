@@ -58,6 +58,7 @@ class StreamConfig:
     yolo_persist: bool = True            # persist tracks across frames
     # Label display
     label_registered_only: bool = False  # True = 등록된 반려동물(pet_profiles)만 라벨 표시
+    show_track_id: bool = True           # True = 라벨에 track/global ID 표시, False = 행동명만 표시
     # Privacy filter
     privacy: bool = False                # 사람 감지 후 프라이버시 필터 적용
     privacy_method: str = "blur"         # blur, mosaic, black

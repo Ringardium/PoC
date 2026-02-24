@@ -35,7 +35,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 │   ├── converter.py         # 포맷 변환 (TorchScript, ONNX, CoreML)
 │   ├── optimization.py      # 최적화 (pruning, quantization)
 │   ├── lightning_training.py # PyTorch Lightning 학습
-│   └── lightning_inference.py
+│   ├── lightning_inference.py
+│   └── train/               # 학습 파이프라인
+│       ├── cli.py           # 학습 CLI (finetune, distill, expand, merge)
+│       ├── config.py        # TrainConfig, DistillConfig, ExpandConfig 등
+│       ├── distill.py       # Knowledge Distillation (teacher-student)
+│       ├── finetune.py      # Fine-tuning
+│       ├── expand.py        # 클래스 확장 학습
+│       ├── merge.py         # 데이터셋 병합
+│       ├── losses.py        # DistillationLoss, FeatureDistillationLoss
+│       ├── utils.py         # 학습 유틸리티
+│       └── configs/         # 기본 YAML 설정 파일
 │
 ├── tools/                   # 유틸리티
 │   ├── privacy_filter.py    # 프라이버시 필터 (blur/mosaic/black)

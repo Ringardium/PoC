@@ -5,18 +5,18 @@
 # For BoT-SORT source code see https://github.com/NirAharon/BoT-SORT
 
 tracker_type: botsort # tracker type, ['botsort', 'bytetrack']
-track_high_thresh: 0.25 # threshold for the first association
+track_high_thresh: 0.45 # threshold for the first association (↑ prevents low-conf detections from hijacking tracks)
 track_low_thresh: 0.1 # threshold for the second association
-new_track_thresh: 0.25 # threshold for init new track if the detection does not match any tracks
-track_buffer: 30 # buffer to calculate the time when to remove tracks
-match_thresh: 0.8 # threshold for matching tracks
+new_track_thresh: 0.4 # threshold for init new track (↑ avoids creating spurious new IDs)
+track_buffer: 90 # buffer to calculate the time when to remove tracks (↑ 30fps×3s, keeps ID alive through occlusion)
+match_thresh: 0.85 # threshold for matching tracks (↑ stricter IoU matching reduces wrong swaps)
 fuse_score: True # Whether to fuse confidence scores with the iou distances before matching
 # min_box_area: 10  # threshold for min box areas(for tracker evaluation, not used for now)
 
 # BoT-SORT settings
 gmc_method: sparseOptFlow # method of global motion compensation
 # ReID model related thresh
-proximity_thresh: 0.5 # minimum IoU for valid match with ReID
-appearance_thresh: 0.8 # minimum appearance similarity for ReID
-with_reid: False
+proximity_thresh: 0.3 # minimum IoU for valid match with ReID (↓ allows ReID to recover distant re-appearances)
+appearance_thresh: 0.65 # minimum appearance similarity for ReID (↓ easier ReID match, tune up if pets look similar)
+with_reid: True # ← enabled: appearance-based re-matching dramatically reduces ID switches
 model: auto # uses native features if detector is YOLO else yolo11n-cls.pt

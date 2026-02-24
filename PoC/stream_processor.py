@@ -30,6 +30,9 @@ from monitor import StatsAggregator
 
 logger = logging.getLogger(__name__)
 
+# Lock for serialising os.environ mutation during capture open (multi-stream safety)
+_capture_env_lock = threading.Lock()
+
 
 class SyncClock:
     """Cross-stream timestamp synchroniser using time-slot bucketing.
@@ -105,6 +108,18 @@ class StreamState:
         # Tracker reset flag: set True to use persist=False on next frame
         self.reset_tracker: bool = False
         self.no_detection_count: int = 0
+        # Frame validation state
+        self.prev_frame_hash: int = 0           # CRC32 of previous frame thumbnail
+        self.stuck_frame_count: int = 0         # Consecutive identical-hash frames
+        self.validation_fail_count: int = 0     # Consecutive validation failures
+        # Adaptive frame skip state
+        self.skip_counter: int = 0              # Remaining frames to skip YOLO
+        self.last_boxes: list = []              # Cached detection results
+        self.last_track_ids: list = []
+        self.last_bowl_boxes: list = []
+        self.last_proc_time: float = 0.0        # Last YOLO processing time (seconds)
+        self.last_velocities: Dict = {}         # track_id -> (dx, dy) per frame for bbox interpolation
+        self.prev_centers: Dict = {}            # track_id -> (cx, cy) from last YOLO frame
 
     def init_behavior_state(self, max_number: int = 500):
         self.close_count = torch.zeros((max_number, max_number))
@@ -345,11 +360,18 @@ class MultiStreamProcessor:
         # Init ReID tracker
         if sc.use_reid:
             from reid import ReIDTracker
-            state.reid_tracker = ReIDTracker(
-                reid_method=sc.reid_method,
+            from reid.tracker import ReIDTrackerConfig
+            reid_config = ReIDTrackerConfig(
+                use_appearance=True,
+                use_motion=True,
+                use_deep_model=(sc.reid_method in ['adaptive', 'mobilenet']),
                 similarity_threshold=sc.reid_threshold,
                 correction_enabled=True,
                 global_id_enabled=sc.reid_global_id,
+            )
+            state.reid_tracker = ReIDTracker(
+                reid_method=sc.reid_method,
+                config=reid_config,
             )
             # Load pet names from profiles
             try:
@@ -433,26 +455,45 @@ class MultiStreamProcessor:
             while self.running and state.active:
                 t0 = time.perf_counter()
 
-                # Read frame in thread pool (blocking I/O)
-                ret, frame = await loop.run_in_executor(self._executor, self._read_frame, state)
+                # Read frame in thread pool with timeout (blocking I/O)
+                try:
+                    read_future = loop.run_in_executor(self._executor, self._read_frame, state)
+                    ret, frame = await asyncio.wait_for(read_future, timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{stream_id}] cap.read() timed out (5s)")
+                    # Discard the stuck cap object (don't release — thread may still be blocked)
+                    state.cap = None
+                    ret, frame = False, None
                 if not ret or frame is None:
                     # For live streams (RTSP/RTMP), reconnect with exponential backoff
                     if self._is_live_stream(sc.input_source):
                         reconnect_attempts += 1
                         backoff = min(2 ** min(reconnect_attempts, 5), max_reconnect_backoff)
-                        logger.warning(f"[{stream_id}] Read failed, reconnecting (attempt {reconnect_attempts}, backoff {backoff}s)...")
-                        # Release old capture to prevent resource leak
+                        logger.warning(
+                            f"[{stream_id}] Read failed — source={sc.input_source}, "
+                            f"attempt={reconnect_attempts}, backoff={backoff}s"
+                        )
                         if state.cap is not None:
                             try:
                                 state.cap.release()
                             except Exception:
                                 pass
                             state.cap = None
+                        # Reset validation state
+                        state.prev_frame_hash = 0
+                        state.stuck_frame_count = 0
+                        state.validation_fail_count = 0
+                        # Estimate dropped frames during backoff
+                        stats = self._stats.get_stream_stats(stream_id)
+                        if stats:
+                            stats.frames_dropped += int(backoff * sc.target_fps)
                         await asyncio.sleep(backoff)
                         state.cap = await self._open_capture(sc)
                         if state.cap is not None:
-                            state.reset_tracker = True  # reset ByteTrack state on next frame
-                            logger.info(f"[{stream_id}] Reconnected successfully")
+                            state.reset_tracker = True
+                            logger.info(f"[{stream_id}] Reconnected (attempt {reconnect_attempts})")
+                        else:
+                            logger.error(f"[{stream_id}] Reconnection failed (attempt {reconnect_attempts})")
                         continue
                     else:
                         logger.info(f"[{stream_id}] End of video")
@@ -460,6 +501,36 @@ class MultiStreamProcessor:
 
                 # Reset reconnect counter on successful read
                 reconnect_attempts = 0
+
+                # --- Frame validation ---
+                is_valid, reason = self._validate_frame(frame, state)
+                if not is_valid:
+                    state.validation_fail_count += 1
+                    stats = self._stats.get_stream_stats(stream_id)
+                    if stats:
+                        stats.frames_dropped += 1
+                    # Proactive reconnection after sustained validation failures
+                    if state.validation_fail_count >= 90 and self._is_live_stream(sc.input_source):
+                        logger.warning(
+                            f"[{stream_id}] {state.validation_fail_count} consecutive "
+                            f"validation failures (last: {reason}), reconnecting..."
+                        )
+                        state.validation_fail_count = 0
+                        if state.cap is not None:
+                            try:
+                                state.cap.release()
+                            except Exception:
+                                pass
+                            state.cap = None
+                        await asyncio.sleep(1)
+                        state.cap = await self._open_capture(sc)
+                        if state.cap is not None:
+                            state.reset_tracker = True
+                    # Throttle loop on invalid frames to prevent spin
+                    await asyncio.sleep(frame_interval)
+                    continue
+                else:
+                    state.validation_fail_count = 0
 
                 state.frame_cnt += 1
                 _, state.frame_timestamp = self._sync_clock.stamp()
@@ -472,14 +543,46 @@ class MultiStreamProcessor:
                             self._executor, self._apply_privacy, sc, frame
                         )
 
-                    # --- YOLO tracking (optional) ---
+                    # --- YOLO tracking with adaptive frame skip ---
                     if needs_yolo:
-                        frame, boxes, track_ids, bowl_boxes = await loop.run_in_executor(
-                            self._executor, self._run_tracking, sc, state, frame
-                        )
+                        run_yolo = True
+                        if self.config.processing.enable_adaptive_skip and state.skip_counter > 0:
+                            # Skip YOLO — reuse cached results with linear interpolation
+                            state.skip_counter -= 1
+                            boxes = self._interpolate_boxes(state)
+                            track_ids = state.last_track_ids
+                            bowl_boxes = state.last_bowl_boxes
+                            run_yolo = False
 
-                        # --- ReID correction (optional) ---
-                        if state.reid_tracker is not None and len(boxes) > 0:
+                        if run_yolo:
+                            t_yolo = time.perf_counter()
+                            frame, boxes, track_ids, bowl_boxes = await loop.run_in_executor(
+                                self._executor, self._run_tracking, sc, state, frame
+                            )
+                            state.last_proc_time = time.perf_counter() - t_yolo
+
+                            # Update velocities from previous centers
+                            self._update_velocities(state, boxes, track_ids)
+
+                            # Cache results for skip frames
+                            state.last_boxes = boxes
+                            state.last_track_ids = track_ids
+                            state.last_bowl_boxes = bowl_boxes
+
+                            # Decide how many frames to skip based on processing load
+                            if self.config.processing.enable_adaptive_skip:
+                                max_skip = self.config.processing.max_frame_skip
+                                # Scale skip count by priority (priority 1 = skip less)
+                                priority_factor = max(1, sc.priority)
+                                if state.last_proc_time > frame_interval * 2:
+                                    state.skip_counter = min(max_skip, priority_factor)
+                                elif state.last_proc_time > frame_interval:
+                                    state.skip_counter = min(max_skip, max(1, priority_factor - 1))
+                                else:
+                                    state.skip_counter = 0
+
+                        # --- ReID correction (optional, only on YOLO frames) ---
+                        if run_yolo and state.reid_tracker is not None and len(boxes) > 0:
                             reid_result = state.reid_tracker.process(frame, boxes, track_ids)
                             raw_corrected = reid_result['corrected_ids']
 
@@ -603,6 +706,97 @@ class MultiStreamProcessor:
         return state.cap.read()
 
     @staticmethod
+    def _validate_frame(
+        frame: np.ndarray,
+        state: "StreamState",
+        stuck_threshold: int = 90,
+    ) -> Tuple[bool, str]:
+        """Validate a frame for corruption, stuck, or blank conditions.
+
+        Returns (is_valid, reason). Runs in < 1ms using downsampled checks.
+        """
+        import zlib
+
+        # 1. Shape check
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            return False, "invalid_shape"
+        h, w = frame.shape[:2]
+        if h == 0 or w == 0:
+            return False, "zero_dimensions"
+
+        # 2. Stuck frame detection via CRC32 of 16x16 thumbnail
+        thumb = cv2.resize(frame, (16, 16), interpolation=cv2.INTER_NEAREST)
+        frame_hash = zlib.crc32(thumb.tobytes())
+
+        if frame_hash == state.prev_frame_hash:
+            state.stuck_frame_count += 1
+            if state.stuck_frame_count >= stuck_threshold:
+                return False, "stuck_frame"
+        else:
+            state.stuck_frame_count = 0
+            state.prev_frame_hash = frame_hash
+
+        # 3. Green corruption check (FFmpeg decode artifact)
+        cy, cx = h // 2, w // 2
+        if h >= 32 and w >= 32:
+            patch = frame[cy - 16:cy + 16, cx - 16:cx + 16]
+        else:
+            patch = thumb
+        b_mean = float(patch[:, :, 0].mean())
+        g_mean = float(patch[:, :, 1].mean())
+        r_mean = float(patch[:, :, 2].mean())
+        if g_mean > 200 and (g_mean - b_mean) > 80 and (g_mean - r_mean) > 80:
+            return False, "green_corruption"
+
+        # 4. Black/blank frame check
+        if float(thumb.mean()) < 5.0:
+            return False, "black_frame"
+
+        return True, "ok"
+
+    @staticmethod
+    def _update_velocities(state: "StreamState", boxes, track_ids):
+        """Compute per-track velocity from previous centers for bbox interpolation."""
+        new_centers = {}
+        for tid, box in zip(track_ids, boxes):
+            if hasattr(box, 'tolist'):
+                cx, cy = box.tolist()[:2]
+            else:
+                cx, cy = box[0], box[1]
+            new_centers[tid] = (cx, cy)
+            if tid in state.prev_centers:
+                px, py = state.prev_centers[tid]
+                state.last_velocities[tid] = (cx - px, cy - py)
+            else:
+                state.last_velocities[tid] = (0.0, 0.0)
+        state.prev_centers = new_centers
+
+    @staticmethod
+    def _interpolate_boxes(state: "StreamState"):
+        """Shift cached bboxes by their velocity for skip frames."""
+        if not state.last_boxes or not state.last_track_ids:
+            return state.last_boxes
+        interpolated = []
+        for tid, box in zip(state.last_track_ids, state.last_boxes):
+            dx, dy = state.last_velocities.get(tid, (0.0, 0.0))
+            if hasattr(box, 'clone'):
+                new_box = box.clone()
+                new_box[0] += dx
+                new_box[1] += dy
+            else:
+                new_box = list(box)
+                new_box[0] += dx
+                new_box[1] += dy
+            interpolated.append(new_box)
+        # Update cached boxes so next skip frame continues from interpolated position
+        if interpolated:
+            if hasattr(state.last_boxes[0], 'clone'):
+                state.last_boxes = torch.stack(interpolated) if len(interpolated) > 0 else []
+            else:
+                state.last_boxes = interpolated
+        return state.last_boxes
+
+    @staticmethod
     def _encode_jpeg(frame: np.ndarray, quality: int = 70) -> bytes:
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
         return buf.tobytes() if ok else b""
@@ -628,22 +822,39 @@ class MultiStreamProcessor:
         if source.isdigit():
             cap = cv2.VideoCapture(int(source))
         elif source.lower().startswith("rtsp://"):
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|analyzeduration;5000000|probesize;5000000"
-            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
-            # Flush initial frames to skip past incomplete GOP
+            with _capture_env_lock:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                    "rtsp_transport;tcp"
+                    "|fflags;nobuffer"
+                    "|analyzeduration;5000000"
+                    "|probesize;5000000"
+                    "|stimeout;5000000"
+                    "|max_delay;500000"
+                    "|reorder_queue_size;150"
+                )
+                cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            # Flush initial frames to skip past incomplete GOP (outside lock)
             if cap.isOpened():
-                for _ in range(30):
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                for _ in range(60):
                     cap.grab()
         elif source.lower().startswith("rtmp://"):
-            os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay|analyzeduration;500000|probesize;500000"
-            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            with _capture_env_lock:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                    "fflags;nobuffer"
+                    "|flags;low_delay"
+                    "|analyzeduration;500000"
+                    "|probesize;500000"
+                    "|timeout;5000000"
+                )
+                cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         else:
             cap = cv2.VideoCapture(source)
         elapsed = time.perf_counter() - t0
         if cap.isOpened():
+            logger.info(f"[capture] Opened in {elapsed:.1f}s: {source}")
             return cap
         logger.warning(f"[capture] Failed after {elapsed:.1f}s: {source}")
         return None
@@ -1019,11 +1230,13 @@ class MultiStreamProcessor:
 
             # Determine label text
             if pet_name:
-                label = f"{pet_name} {behavior}"
+                label = f"{pet_name} {behavior}" if sc.show_track_id else behavior
             elif registered_only:
                 # Unregistered pet — bbox only, no label
                 cv2.rectangle(frame, pt1, pt2, COLOR_MAP["none"], 1)
                 continue
+            elif not sc.show_track_id:
+                label = behavior
             elif gid is not None:
                 label = f"G:{gid} {behavior}"
             else:
