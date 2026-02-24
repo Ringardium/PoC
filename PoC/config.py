@@ -22,7 +22,7 @@ class StreamConfig:
     task_active: bool = False
     threshold: float = 0.3
     fight_speed_threshold: float = 5.0
-    inert_threshold: float = 50.0
+    inert_threshold: float = 1.5   # avg speed (px/frame) — below this = inert
     inert_frames: int = 100
     sleep_threshold: float = 30.0
     sleep_frames: int = 200
@@ -36,9 +36,9 @@ class StreamConfig:
     bathroom_trigger_frames: int = 30
     bathroom_height_drop: float = 0.25
     bathroom_cls_conf: float = 0.5
-    active_threshold: float = 800.0
+    active_threshold: float = 800.0  # ignored (kept for backward compat)
     active_frames: int = 90
-    active_speed_threshold: float = 12.0  # 평균 속도 (px/frame) 이상이어야 active
+    active_speed_threshold: float = 5.0  # avg speed (px/frame) — above this = active
     reset_frames: int = 20
     flag_frames: int = 40
     priority: int = 1  # 1=highest, 3=lowest
@@ -56,6 +56,8 @@ class StreamConfig:
     yolo_agnostic_nms: bool = False      # class-agnostic NMS
     yolo_verbose: bool = False           # verbose inference logging
     yolo_persist: bool = True            # persist tracks across frames
+    # Label display
+    label_registered_only: bool = False  # True = 등록된 반려동물(pet_profiles)만 라벨 표시
     # Privacy filter
     privacy: bool = False                # 사람 감지 후 프라이버시 필터 적용
     privacy_method: str = "blur"         # blur, mosaic, black
@@ -108,6 +110,9 @@ class SystemConfig:
     event_api_url: Optional[str] = None  # Backend URL for behavior events (None = disabled)
     hls_s3_bucket: Optional[str] = None  # S3 bucket for HLS output (None = disabled)
     hls_s3_prefix: str = "hls/live"      # S3 key prefix
+    clip_s3_prefix: str = "clips/events" # S3 key prefix for event clips
+    clip_pre_seconds: float = 2.0        # 이벤트 전 녹화 시간 (초)
+    clip_post_seconds: float = 2.0       # 이벤트 후 녹화 시간 (초)
 
     def to_dict(self) -> dict:
         data = {
@@ -123,6 +128,9 @@ class SystemConfig:
             "event_api_url": self.event_api_url,
             "hls_s3_bucket": self.hls_s3_bucket,
             "hls_s3_prefix": self.hls_s3_prefix,
+            "clip_s3_prefix": self.clip_s3_prefix,
+            "clip_pre_seconds": self.clip_pre_seconds,
+            "clip_post_seconds": self.clip_post_seconds,
         }
         return data
 
@@ -147,6 +155,9 @@ class SystemConfig:
             event_api_url=data.get("event_api_url"),
             hls_s3_bucket=data.get("hls_s3_bucket"),
             hls_s3_prefix=data.get("hls_s3_prefix", "hls/live"),
+            clip_s3_prefix=data.get("clip_s3_prefix", "clips/events"),
+            clip_pre_seconds=data.get("clip_pre_seconds", 2.0),
+            clip_post_seconds=data.get("clip_post_seconds", 2.0),
         )
 
     def save(self, path: str):

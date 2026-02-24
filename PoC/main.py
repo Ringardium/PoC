@@ -192,8 +192,8 @@ def run(
         logger.warning(f"Too many streams ({len(sys_config.streams)}), limiting to {max_streams}")
         sys_config.streams = sys_config.streams[:max_streams]
 
-    # Create processor
-    processor = MultiStreamProcessor(sys_config)
+    # Create processor (headless — no web viewer)
+    processor = MultiStreamProcessor(sys_config, web_enabled=False)
 
     # Setup graceful exit
     exit_handler = GracefulExit(processor)
@@ -274,8 +274,8 @@ def benchmark(config: str, duration: int, warmup: int):
     logger.info(f"Loading configuration from {config}")
     sys_config = SystemConfig.load(config)
 
-    # Create processor
-    processor = MultiStreamProcessor(sys_config)
+    # Create processor (headless — no web viewer)
+    processor = MultiStreamProcessor(sys_config, web_enabled=False)
 
     # Setup exit handler
     exit_handler = GracefulExit(processor)

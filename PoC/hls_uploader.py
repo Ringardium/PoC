@@ -33,8 +33,8 @@ class HLSUploader:
         height: int,
         s3_bucket: str,
         s3_prefix: str = "hls/live",
-        segment_duration: int = 1,
-        playlist_size: int = 8,
+        segment_duration: int = 2,
+        playlist_size: int = 10,
     ):
         self._stream_id = stream_id
         self._fps = fps
@@ -173,7 +173,7 @@ class HLSUploader:
         last_playlist_mtime = 0.0
 
         while self._running:
-            time.sleep(0.5)
+            time.sleep(0.2)
             try:
                 local_ts = list(self._tmp_dir.glob(f"{self._session}_*.ts"))
                 if not local_ts:
