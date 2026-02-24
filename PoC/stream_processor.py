@@ -216,12 +216,8 @@ class MultiStreamProcessor:
             if sc.yolo_classes and state.model is None:
                 state.model = YOLO(model_path)
 
-        # Load privacy filter model if any stream needs it (shared — no persist state)
-        if self._privacy_model is None:
-            for sc in self.streams.values():
-                if sc.privacy:
-                    self._privacy_model = YOLO(sc.privacy_model)
-                    break
+        # Privacy filter is now handled within _run_tracking (same inference pass).
+        # No separate model needed — person (class 0) is added to detection classes.
 
     # ------------------------------------------------------------------
     # Stream lifecycle
@@ -537,12 +533,6 @@ class MultiStreamProcessor:
 
                 # --- Processing block: wrapped so transient errors don't kill the stream ---
                 try:
-                    # --- Privacy filter (person detection → blur/mosaic/black) ---
-                    if sc.privacy and self._privacy_model is not None:
-                        frame = await loop.run_in_executor(
-                            self._executor, self._apply_privacy, sc, frame
-                        )
-
                     # --- YOLO tracking with adaptive frame skip ---
                     if needs_yolo:
                         run_yolo = True
@@ -884,6 +874,10 @@ class MultiStreamProcessor:
     def _run_tracking(self, sc: StreamConfig, state: StreamState, frame: np.ndarray):
         """Run YOLO tracking on a single frame. Returns (frame, boxes, track_ids, bowl_boxes).
 
+        When ``sc.privacy`` is enabled, person (class 0) is detected in the
+        same inference pass and privacy filter is applied to the frame before
+        returning — no separate model call needed.
+
         Each stream uses its own ``state.model`` instance so tracker state
         (Kalman filters, track IDs) is fully isolated between streams.
         Concurrent GPU inference is limited via ``_gpu_sem`` to prevent CUDA OOM.
@@ -895,16 +889,40 @@ class MultiStreamProcessor:
             tracker_yaml = "bytetrack.yaml" if sc.method == "bytetrack" else "botsort.yaml"
             # Use persist=False to reset tracker after reconnection or prolonged no-detection
             use_persist = sc.yolo_persist and not state.reset_tracker
+
+            # Build detection classes: pets + bowls + person (if privacy)
+            det_classes = list(sc.yolo_classes or [1])
+            if sc.privacy and 0 not in det_classes:
+                det_classes.append(0)
+
             with self._gpu_sem:
                 results = state.model.track(
                     frame, persist=use_persist, conf=sc.yolo_conf, iou=sc.yolo_iou,
-                    classes=sc.yolo_classes or [1], tracker=tracker_yaml,
+                    classes=det_classes, tracker=tracker_yaml,
                     device=device, half=half, verbose=False,
                 )
             if state.reset_tracker:
                 state.reset_tracker = False
             ids = results[0].boxes.id
             cls = results[0].boxes.cls.cpu() if results[0].boxes.cls is not None else None
+
+            # Apply privacy filter from same results (person = class 0)
+            if sc.privacy and cls is not None:
+                all_xyxy_np = results[0].boxes.xyxy.cpu().numpy()
+                for i, c in enumerate(cls):
+                    if int(c) == 0:
+                        x1, y1, x2, y2 = map(int, all_xyxy_np[i])
+                        pad = 10
+                        x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+                        x2 = min(frame.shape[1], x2 + pad)
+                        y2 = min(frame.shape[0], y2 + pad)
+                        if sc.privacy_method == "mosaic":
+                            frame = apply_mosaic(frame, x1, y1, x2, y2)
+                        elif sc.privacy_method == "black":
+                            frame = apply_black_box(frame, x1, y1, x2, y2)
+                        else:
+                            frame = apply_blur(frame, x1, y1, x2, y2)
+
             if ids is None:
                 state.no_detection_count += 1
                 # Auto-reset tracker if no detections for 90+ consecutive frames
@@ -917,7 +935,7 @@ class MultiStreamProcessor:
                 all_xywh = results[0].boxes.xywh.cpu()
                 all_xyxy = results[0].boxes.xyxy.cpu().numpy()
                 all_ids = results[0].boxes.id.int().cpu().tolist()
-                # Separate pets (class 1) and bowls (class 3)
+                # Separate pets (class 1) and bowls (class 3), skip person (class 0)
                 all_conf = results[0].boxes.conf.cpu()
                 pet_entries = []  # (conf, xywh, id)
                 bowl_boxes = []
