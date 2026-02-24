@@ -145,10 +145,33 @@ class GalleryMatchingStrategy(ABC):
 
 
 class WeightedMultiFeatureMatching(GalleryMatchingStrategy):
-    """가중 다중 특징 매칭"""
+    """가중 다중 특징 Top-K 매칭.
+
+    갤러리의 저장된 특징 전부(최대 K개)와 비교하여 최고 유사도 사용.
+    EMA 대표 특징만 쓰는 것보다 드리프트에 강건함.
+    """
 
     def __init__(self, feature_weights: Dict[str, float] = None):
         self.feature_weights = feature_weights or {}
+
+    def _gallery_similarity(self, query_feat: np.ndarray,
+                            gallery: MultiFeatureGallery,
+                            feat_type: str) -> float:
+        """query와 갤러리 저장 특징 전부 비교, 최고 유사도 반환."""
+        stored = gallery.features.get(feat_type)
+        if not stored:
+            # fallback to representative
+            rep = gallery.representatives.get(feat_type)
+            if rep is not None:
+                return float(np.dot(query_feat, rep))
+            return 0.0
+
+        best = 0.0
+        for feat in stored:
+            sim = float(np.dot(query_feat, feat))
+            if sim > best:
+                best = sim
+        return best
 
     def match(self, query_features: Dict[str, np.ndarray],
               galleries: Dict[int, MultiFeatureGallery],
@@ -163,26 +186,20 @@ class WeightedMultiFeatureMatching(GalleryMatchingStrategy):
             if gid in exclude_ids:
                 continue
 
-            if not gallery.representatives:
+            if not gallery.features and not gallery.representatives:
                 continue
 
             total_sim = 0.0
             total_weight = 0.0
 
             for feat_type, query_feat in query_features.items():
-                if feat_type not in gallery.representatives:
-                    continue
-
-                gallery_feat = gallery.representatives[feat_type]
-                sim = float(np.dot(query_feat, gallery_feat))
-
+                sim = self._gallery_similarity(query_feat, gallery, feat_type)
                 weight = self.feature_weights.get(feat_type, 1.0)
                 total_sim += sim * weight
                 total_weight += weight
 
             if total_weight > 0:
                 avg_sim = total_sim / total_weight
-
                 if avg_sim > best_sim:
                     best_sim = avg_sim
                     best_match = gid
@@ -243,7 +260,7 @@ class GlobalIDManagerConfig:
     similarity_threshold: float = 0.6
     max_gallery_size: int = 100
     inactive_timeout: float = 300.0
-    ema_alpha: float = 0.3
+    ema_alpha: float = 0.1
     matching_strategy: str = 'weighted'  # 'weighted', 'single'
     feature_weights: Dict[str, float] = field(default_factory=lambda: {
         'appearance': 1.0,

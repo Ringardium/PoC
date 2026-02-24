@@ -83,7 +83,7 @@ class ReIDTrackerConfig:
 
     # 갤러리 관리
     gallery_max_size: int = 10
-    gallery_ema_alpha: float = 0.3
+    gallery_ema_alpha: float = 0.1
     max_disappeared_frames: int = 30
 
     # 글로벌 ID

@@ -21,13 +21,14 @@ logger = logging.getLogger(__name__)
 class _PendingClip:
     """A clip that is still collecting post-event frames."""
 
-    __slots__ = ("pre_frames", "post_frames", "post_remaining", "event_info")
+    __slots__ = ("pre_frames", "post_frames", "post_remaining", "event_info", "s3_key")
 
-    def __init__(self, pre_frames: List[np.ndarray], post_needed: int, event_info: dict):
+    def __init__(self, pre_frames: List[np.ndarray], post_needed: int, event_info: dict, s3_key: str):
         self.pre_frames = pre_frames
         self.post_frames: List[np.ndarray] = []
         self.post_remaining = post_needed
         self.event_info = event_info
+        self.s3_key = s3_key
 
 
 class EventClipRecorder:
@@ -111,31 +112,42 @@ class EventClipRecorder:
             for clip in completed:
                 self._pending.remove(clip)
                 all_frames = clip.pre_frames + clip.post_frames
-                self._submit_encode(all_frames, clip.event_info)
+                self._submit_encode(all_frames, clip.event_info, clip.s3_key)
 
-    def trigger(self, event_info: dict):
-        """Trigger clip recording for an event. Snapshots the ring buffer as pre-event frames."""
+    def trigger(self, event_info: dict) -> Optional[str]:
+        """Trigger clip recording for an event. Returns the S3 key for the clip."""
+        # Compute S3 key at trigger time (deterministic, before upload)
+        now = datetime.now(timezone.utc)
+        timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+        behavior = event_info.get("behaviorType", "unknown")
+        dog_id = str(event_info.get("dogId", "unknown"))
+        safe_dog_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in dog_id)
+        filename = f"{timestamp_str}_{behavior}_{safe_dog_id}.mp4"
+        s3_key = f"{self._s3_prefix}/{self._stream_id}/{filename}"
+
         with self._lock:
             if len(self._pending) >= self._max_pending:
                 logger.warning(
                     f"[{self._stream_id}] Clip queue full ({self._max_pending}), "
-                    f"dropping clip for {event_info.get('behaviorType', '?')}"
+                    f"dropping clip for {behavior}"
                 )
-                return
+                return None
 
             pre_frames = [f.copy() for f in self._ring]
-            clip = _PendingClip(pre_frames, self._post_frames_count, event_info)
+            clip = _PendingClip(pre_frames, self._post_frames_count, event_info, s3_key)
             self._pending.append(clip)
 
         logger.info(
-            f"[{self._stream_id}] Clip triggered: {event_info.get('behaviorType', '?')} "
-            f"dog={event_info.get('dogId', '?')}, pre={len(pre_frames)}f, post={self._post_frames_count}f"
+            f"[{self._stream_id}] Clip triggered: {behavior} "
+            f"dog={dog_id}, pre={len(pre_frames)}f, post={self._post_frames_count}f, "
+            f"key={s3_key}"
         )
+        return s3_key
 
-    def _submit_encode(self, frames: List[np.ndarray], event_info: dict):
+    def _submit_encode(self, frames: List[np.ndarray], event_info: dict, s3_key: str):
         """Queue frames for background encoding + upload."""
         with self._encode_lock:
-            self._encode_queue.append((frames, event_info))
+            self._encode_queue.append((frames, event_info, s3_key))
         self._encode_event.set()
 
     def _encode_worker(self):
@@ -148,26 +160,19 @@ class EventClipRecorder:
                 with self._encode_lock:
                     if not self._encode_queue:
                         break
-                    frames, event_info = self._encode_queue.pop(0)
+                    frames, event_info, s3_key = self._encode_queue.pop(0)
 
                 try:
-                    self._encode_and_upload(frames, event_info)
+                    self._encode_and_upload(frames, event_info, s3_key)
                 except Exception as e:
                     logger.warning(f"[{self._stream_id}] Clip encode/upload failed: {e}")
 
-    def _encode_and_upload(self, frames: List[np.ndarray], event_info: dict):
+    def _encode_and_upload(self, frames: List[np.ndarray], event_info: dict, s3_key: str):
         """Encode frame list to MP4 via FFmpeg, then upload to S3."""
         if not frames:
             return
 
-        behavior = event_info.get("behaviorType", "unknown")
-        dog_id = str(event_info.get("dogId", "unknown"))
-        # Sanitize dog_id for filename
-        safe_dog_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in dog_id)
-        now = datetime.now(timezone.utc)
-        timestamp_str = now.strftime("%Y%m%d_%H%M%S")
-
-        filename = f"{timestamp_str}_{behavior}_{safe_dog_id}.mp4"
+        filename = s3_key.rsplit("/", 1)[-1]
 
         # Temp file for MP4 output
         tmp_dir = tempfile.mkdtemp(prefix="clip_")
@@ -207,7 +212,6 @@ class EventClipRecorder:
                 return
 
             # Upload to S3
-            s3_key = f"{self._s3_prefix}/{self._stream_id}/{filename}"
             self._s3.upload_file(
                 mp4_path,
                 self._s3_bucket,
@@ -235,7 +239,7 @@ class EventClipRecorder:
             for clip in self._pending:
                 all_frames = clip.pre_frames + clip.post_frames
                 if all_frames:
-                    self._submit_encode(all_frames, clip.event_info)
+                    self._submit_encode(all_frames, clip.event_info, clip.s3_key)
             self._pending.clear()
 
         # Signal worker and wait

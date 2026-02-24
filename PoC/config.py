@@ -113,6 +113,7 @@ class SystemConfig:
     clip_s3_prefix: str = "clips/events" # S3 key prefix for event clips
     clip_pre_seconds: float = 2.0        # 이벤트 전 녹화 시간 (초)
     clip_post_seconds: float = 2.0       # 이벤트 후 녹화 시간 (초)
+    cdn_base_url: Optional[str] = None   # CDN base URL (e.g. "https://cdn.mungwoofai.cloud")
 
     def to_dict(self) -> dict:
         data = {
@@ -131,6 +132,7 @@ class SystemConfig:
             "clip_s3_prefix": self.clip_s3_prefix,
             "clip_pre_seconds": self.clip_pre_seconds,
             "clip_post_seconds": self.clip_post_seconds,
+            "cdn_base_url": self.cdn_base_url,
         }
         return data
 
@@ -158,6 +160,7 @@ class SystemConfig:
             clip_s3_prefix=data.get("clip_s3_prefix", "clips/events"),
             clip_pre_seconds=data.get("clip_pre_seconds", 2.0),
             clip_post_seconds=data.get("clip_post_seconds", 2.0),
+            cdn_base_url=data.get("cdn_base_url"),
         )
 
     def save(self, path: str):

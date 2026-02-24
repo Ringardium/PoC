@@ -259,12 +259,147 @@ class MobileNetFeatureExtractor(FeatureExtractor):
             return [self.get_zero_feature() for _ in images]
 
 
+class DINOv2FeatureExtractor(FeatureExtractor):
+    """
+    DINOv2 ViT-S/14 기반 특징 추출.
+    Self-supervised 학습으로 인스턴스 레벨 구분에 뛰어남.
+    GPU에서 ~5ms, 384차원 특징 벡터.
+    """
+
+    def __init__(self, config: FeatureConfig = None,
+                 model_name: str = 'dinov2_vits14',
+                 input_size: tuple = (224, 224)):
+        config = config or FeatureConfig(name="dinov2")
+        super().__init__(config)
+
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("PyTorch is required for DINOv2FeatureExtractor")
+
+        self.model_name = model_name
+        self.input_size = input_size  # (H, W)
+        self._feature_dim = 384  # vits14 default
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.transform = T.Compose([
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+        self.inference_times = deque(maxlen=100)
+        self._initialize()
+
+    def _initialize(self):
+        try:
+            self.model = torch.hub.load(
+                'facebookresearch/dinov2', self.model_name, verbose=False
+            )
+            self.model.eval()
+            self.model.to(self.device)
+
+            # 실제 특징 차원 확인
+            with torch.no_grad():
+                dummy = torch.randn(1, 3, *self.input_size).to(self.device)
+                out = self.model(dummy)
+                self._feature_dim = out.shape[1]
+
+            self._initialized = True
+            self.logger.info(
+                f"DINOv2 ({self.model_name}) initialized on {self.device}, "
+                f"feature_dim={self._feature_dim}"
+            )
+        except Exception as e:
+            self.logger.error(f"DINOv2 initialization failed: {e}")
+            self.model = None
+
+    @property
+    def feature_dim(self) -> int:
+        return self._feature_dim
+
+    @property
+    def feature_type(self) -> str:
+        return "appearance"
+
+    def _preprocess(self, image: np.ndarray) -> Optional[torch.Tensor]:
+        """BGR image → normalized tensor."""
+        if image is None or image.size == 0:
+            return None
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (self.input_size[1], self.input_size[0]),
+                             interpolation=cv2.INTER_LINEAR)
+        return self.transform(resized)
+
+    def extract(self, image: np.ndarray, context: TrackContext = None) -> FeatureOutput:
+        if self.model is None or image is None or image.size == 0:
+            return self.get_zero_feature()
+
+        try:
+            start = time.time()
+            tensor = self._preprocess(image)
+            if tensor is None:
+                return self.get_zero_feature()
+
+            with torch.no_grad():
+                features = self.model(tensor.unsqueeze(0).to(self.device))
+                features = features.squeeze().cpu().numpy()
+
+            features = self.normalize(features)
+            self.inference_times.append(time.time() - start)
+
+            return FeatureOutput(
+                feature=features.astype(np.float32),
+                feature_type=self.feature_type,
+                confidence=1.0,
+                metadata={'inference_time': self.inference_times[-1]}
+            )
+        except Exception as e:
+            self.logger.warning(f"DINOv2 extraction failed: {e}")
+            return self.get_zero_feature()
+
+    def extract_batch(self, images: List[np.ndarray],
+                     contexts: List[TrackContext] = None) -> List[FeatureOutput]:
+        if self.model is None or not images:
+            return [self.get_zero_feature() for _ in range(len(images) if images else 0)]
+
+        try:
+            batch_tensors = []
+            valid_indices = []
+
+            for i, img in enumerate(images):
+                tensor = self._preprocess(img)
+                if tensor is not None:
+                    batch_tensors.append(tensor)
+                    valid_indices.append(i)
+
+            if not batch_tensors:
+                return [self.get_zero_feature() for _ in images]
+
+            batch = torch.stack(batch_tensors).to(self.device)
+
+            with torch.no_grad():
+                batch_features = self.model(batch).cpu().numpy()
+
+            outputs = [self.get_zero_feature() for _ in images]
+            for i, valid_idx in enumerate(valid_indices):
+                features = self.normalize(batch_features[i])
+                outputs[valid_idx] = FeatureOutput(
+                    feature=features.astype(np.float32),
+                    feature_type=self.feature_type,
+                    confidence=1.0
+                )
+            return outputs
+
+        except Exception as e:
+            self.logger.warning(f"DINOv2 batch extraction failed: {e}")
+            return [self.get_zero_feature() for _ in images]
+
+
 class AdaptiveAppearanceExtractor(FeatureExtractor):
     """
     적응형 외형 특징 추출 - 상황에 따라 경량/정밀 모델 선택
 
     - 기본: Histogram (빠름)
-    - ID 스위칭 의심시/새 트랙: MobileNet (정확)
+    - ID 스위칭 의심시/새 트랙: DINOv2 (정확)
     """
 
     def __init__(self, config: FeatureConfig = None,
@@ -284,11 +419,15 @@ class AdaptiveAppearanceExtractor(FeatureExtractor):
 
         if self.use_deep_model:
             try:
-                self.deep_extractor = MobileNetFeatureExtractor()
-                self.deep_extractor.initialize()
+                self.deep_extractor = DINOv2FeatureExtractor()
             except Exception as e:
-                self.logger.warning(f"Deep model init failed: {e}")
-                self.deep_extractor = None
+                self.logger.warning(f"DINOv2 init failed, falling back to MobileNet: {e}")
+                try:
+                    self.deep_extractor = MobileNetFeatureExtractor()
+                    self.deep_extractor.initialize()
+                except Exception as e2:
+                    self.logger.warning(f"MobileNet init also failed: {e2}")
+                    self.deep_extractor = None
 
         # 특징 차원 계산
         self._feature_dim = self.fast_extractor.feature_dim

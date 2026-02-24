@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -752,11 +753,16 @@ class MultiStreamProcessor:
         clip_rec = self._clip_recorders.get(sc.stream_id)
 
         def _send_event(event: dict):
-            """Send event via API and trigger clip recording."""
+            """Send event via API and trigger clip recording. Skips if dogId is None."""
+            if event.get("dogId") is None:
+                return
+            event["detectedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            if clip_rec:
+                s3_key = clip_rec.trigger(event)
+                if s3_key and self.config.cdn_base_url:
+                    event["clipUrl"] = f"{self.config.cdn_base_url.rstrip('/')}/{s3_key}"
             if self._event_sender:
                 self._event_sender.send(event)
-            if clip_rec:
-                clip_rec.trigger(event)
 
         # Map track_ids → behavior_ids (use global_id when available)
         behavior_ids = []
@@ -767,13 +773,11 @@ class MultiStreamProcessor:
             behavior_ids.append(bid)
             tid_to_bid[tid] = bid
 
-        # Resolve display name / event ID: pet_name > global_id > track_id
         def _resolve_dog_id(bid):
-            """Return the best identifier for API events."""
-            name = state.global_id_names.get(bid)
-            if name:
-                return name
-            return bid
+            """Return global_id for API events, or None if not assigned."""
+            if bid in state.global_id_map.values():
+                return bid
+            return None
 
         # Prepare coordinates (keyed by behavior_id)
         for bid in behavior_ids:

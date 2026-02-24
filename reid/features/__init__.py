@@ -5,7 +5,7 @@ Extensible Feature Extraction Framework
 
 Architecture:
     FeatureExtractor (base)
-        ├── Appearance: HistogramFeatureExtractor, MobileNetFeatureExtractor, AdaptiveAppearanceExtractor
+        ├── Appearance: HistogramFeatureExtractor, MobileNetFeatureExtractor, DINOv2FeatureExtractor, AdaptiveAppearanceExtractor
         ├── Motion: MotionFeatureExtractor, OpticalFlowFeatureExtractor, TrajectoryFeatureExtractor
         └── (extensible: Behavior, Audio, etc.)
 
@@ -33,6 +33,7 @@ from .base import (
 from .appearance import (
     HistogramFeatureExtractor,
     MobileNetFeatureExtractor,
+    DINOv2FeatureExtractor,
     AdaptiveAppearanceExtractor,
     ColorLayoutExtractor
 )
@@ -94,6 +95,7 @@ __all__ = [
     # Appearance
     'HistogramFeatureExtractor',
     'MobileNetFeatureExtractor',
+    'DINOv2FeatureExtractor',
     'AdaptiveAppearanceExtractor',
     'ColorLayoutExtractor',
 
