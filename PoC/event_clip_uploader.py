@@ -77,6 +77,9 @@ class EventClipRecorder:
         self._pending: List[_PendingClip] = []
         self._lock = threading.Lock()
 
+        # Per-(dog, behavior) clip counter for sequential numbering
+        self._clip_counter: Dict[str, int] = {}
+
         # Background thread for encoding + upload
         self._running = True
         self._encode_queue: List[tuple] = []  # (frames, event_info)
@@ -116,13 +119,20 @@ class EventClipRecorder:
 
     def trigger(self, event_info: dict) -> Optional[str]:
         """Trigger clip recording for an event. Returns the S3 key for the clip."""
-        # Compute S3 key at trigger time (deterministic, before upload)
-        now = datetime.now(timezone.utc)
-        timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+        from datetime import timedelta as _td
+        KST = timezone(_td(hours=9))
+        now = datetime.now(KST)
+        date_str = now.strftime("%Y%m%d")
         behavior = event_info.get("behaviorType", "unknown")
         dog_id = str(event_info.get("dogId", "unknown"))
         safe_dog_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in dog_id)
-        filename = f"{timestamp_str}_{behavior}_{safe_dog_id}.mp4"
+
+        # Sequential behavior number per (dog, behavior)
+        counter_key = f"{safe_dog_id}_{behavior}"
+        self._clip_counter[counter_key] = self._clip_counter.get(counter_key, 0) + 1
+        seq = self._clip_counter[counter_key]
+
+        filename = f"{date_str}_{safe_dog_id}_{behavior}_{seq:03d}.mp4"
         s3_key = f"{self._s3_prefix}/{self._stream_id}/{filename}"
 
         with self._lock:
