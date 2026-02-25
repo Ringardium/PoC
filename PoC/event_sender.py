@@ -5,7 +5,7 @@ import math
 import queue
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 import requests
@@ -31,7 +31,7 @@ class BehaviorStateTracker:
     When a dog stops the behavior, the tracker yields a completed event with duration.
     """
 
-    def __init__(self, behavior: str, min_duration_min: float = 1.0):
+    def __init__(self, behavior: str, min_duration_min: float = 0.0):
         self._behavior = behavior
         self._min_duration_min = min_duration_min
         # track_id -> {"start_time": float, "start_frame": int}
@@ -67,23 +67,21 @@ class BehaviorStateTracker:
 
         for tid in finished:
             state = self._active.pop(tid)
-            duration_sec = now - state["start_time"]
-            # Ceil to 1 decimal place (e.g. 1.01 → 1.1, 2.50 → 2.5)
-            duration_min = math.ceil(duration_sec / 60 * 10) / 10
+            duration_sec = int(now - state["start_time"])
 
-            if duration_min < self._min_duration_min:
-                logger.debug(
-                    f"{self._behavior} too short, skipping: dog {tid}, {duration_min:.1f}min"
-                )
+            if duration_sec <= 0:
                 continue
 
+            KST = timezone(timedelta(hours=9))
+            now_kst = datetime.now(KST)
             ended_events.append({
                 "dogId": tid,
                 "behaviorType": BEHAVIOR_TYPE_MAP[self._behavior],
-                "durationMinutes": duration_min,
+                "durationSeconds": duration_sec,
+                "detectedAt": now_kst.strftime("%Y-%m-%dT%H:%M:%S"),
             })
             logger.info(
-                f"{self._behavior} ended: dog {tid}, duration {duration_min:.1f}min "
+                f"{self._behavior} ended: dog {tid}, duration {duration_sec:.1f}s "
                 f"(frames {state['start_frame']}-{frame_cnt})"
             )
 
@@ -154,12 +152,18 @@ def send_event_cli():
         choices=list(BEHAVIOR_TYPE_MAP.values()),
         help="Behavior type",
     )
-    parser.add_argument("--duration", type=float, default=None, help="Duration in minutes (for sleeping/playing)")
+    parser.add_argument("--duration", type=float, default=None, help="Duration in seconds (for sleeping/playing)")
     args = parser.parse_args()
 
-    event = {"dogId": args.dog_id, "behaviorType": args.behavior}
+    KST = timezone(timedelta(hours=9))
+    now_kst = datetime.now(KST)
+    event = {
+        "dogId": args.dog_id,
+        "behaviorType": args.behavior,
+        "detectedAt": now_kst.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
     if args.duration is not None:
-        event["durationMinutes"] = args.duration
+        event["durationSeconds"] = args.duration
 
     resp = requests.post(args.url, json=event, timeout=5.0)
     print(f"[{resp.status_code}] {resp.text}")

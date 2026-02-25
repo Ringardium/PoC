@@ -101,7 +101,7 @@ class StreamState:
         self.global_id_names: Dict[int, str] = {}  # global_id -> pet name
         # ID stabilization buffer: track_id -> {candidate_id, count}
         self.id_stable_buffer: Dict[int, Dict] = {}
-        self.id_stable_threshold: int = 5  # N consecutive frames to confirm ID change
+        self.id_stable_threshold: int = 8  # N consecutive frames to confirm ID change
         # Output writer
         self.writer: Optional[cv2.VideoWriter] = None
         self.active: bool = False
@@ -120,6 +120,15 @@ class StreamState:
         self.last_proc_time: float = 0.0        # Last YOLO processing time (seconds)
         self.last_velocities: Dict = {}         # track_id -> (dx, dy) per frame for bbox interpolation
         self.prev_centers: Dict = {}            # track_id -> (cx, cy) from last YOLO frame
+        self._yolo_frame_gap: int = 1           # frames between consecutive YOLO runs
+        self._frames_since_yolo: int = 0        # counter incremented every frame
+        self.last_dog_behavior: Dict[int, str] = {}  # bid -> behavior name (cached for skip frames)
+        # Bbox EMA smoothing: track_id -> [cx, cy, w, h]
+        self.smoothed_boxes: Dict[int, list] = {}
+        # Privacy: cached person bboxes for skip frames (list of [x1,y1,x2,y2])
+        self.last_person_boxes: list = []
+        # Class stabilization: {track_id: {'cls': int, 'candidate': int, 'count': int}}
+        self.track_class_buffer: Dict[int, Dict] = {}
 
     def init_behavior_state(self, max_number: int = 500):
         self.close_count = torch.zeros((max_number, max_number))
@@ -228,9 +237,9 @@ class MultiStreamProcessor:
         self._states[sc.stream_id] = StreamState(sc)
         self._stats.register_stream(sc.stream_id)
         if sc.task_sleep:
-            self._sleep_trackers[sc.stream_id] = BehaviorStateTracker("sleep", min_duration_min=1.0)
+            self._sleep_trackers[sc.stream_id] = BehaviorStateTracker("sleep")
         if sc.task_active:
-            self._active_trackers[sc.stream_id] = BehaviorStateTracker("active", min_duration_min=1.0)
+            self._active_trackers[sc.stream_id] = BehaviorStateTracker("active")
 
     def _unregister_stream(self, stream_id: str):
         state = self._states.get(stream_id)
@@ -369,13 +378,19 @@ class MultiStreamProcessor:
                 reid_method=sc.reid_method,
                 config=reid_config,
             )
-            # Load pet names from profiles
+            # Load pet profiles: pre-register galleries + name map
             try:
+                ref_dir = Path(__file__).resolve().parent / "references"
+                # Pre-register pet reference images using tracker's own feature extractor
+                state.reid_tracker.register_pet_profiles(str(ref_dir))
+                # Load name map for label display
                 from tools.pet_profiles import PetProfileStore
-                store = PetProfileStore("references")
+                store = PetProfileStore(str(ref_dir))
                 state.global_id_names = store.get_name_map()
-            except Exception:
-                pass
+                if state.global_id_names:
+                    logger.info(f"Loaded pet names: {state.global_id_names}")
+            except Exception as e:
+                logger.warning(f"Failed to load pet profiles: {e}")
 
         if needs_behavior:
             state.init_behavior_state()
@@ -442,6 +457,7 @@ class MultiStreamProcessor:
         logger.info(f"[{stream_id}] Ready — {state.width}x{state.height} @ {sc.target_fps}fps")
 
         loop = asyncio.get_running_loop()
+        next_frame_time = time.perf_counter()  # cumulative frame-rate target
         reconnect_attempts = 0
         max_reconnect_backoff = 30  # max seconds between reconnection attempts
         consecutive_errors = 0
@@ -536,6 +552,7 @@ class MultiStreamProcessor:
                     # --- YOLO tracking with adaptive frame skip ---
                     if needs_yolo:
                         run_yolo = True
+                        state._frames_since_yolo += 1
                         if self.config.processing.enable_adaptive_skip and state.skip_counter > 0:
                             # Skip YOLO — reuse cached results with linear interpolation
                             state.skip_counter -= 1
@@ -543,15 +560,32 @@ class MultiStreamProcessor:
                             track_ids = state.last_track_ids
                             bowl_boxes = state.last_bowl_boxes
                             run_yolo = False
+                            # Apply cached privacy filter on skip frames
+                            if sc.privacy and state.last_person_boxes:
+                                for px1, py1, px2, py2 in state.last_person_boxes:
+                                    if sc.privacy_method == "mosaic":
+                                        frame = apply_mosaic(frame, px1, py1, px2, py2)
+                                    elif sc.privacy_method == "black":
+                                        frame = apply_black_box(frame, px1, py1, px2, py2)
+                                    else:
+                                        frame = apply_blur(frame, px1, py1, px2, py2)
 
                         if run_yolo:
+                            # Record frame gap for velocity normalization
+                            state._yolo_frame_gap = max(1, state._frames_since_yolo)
+                            state._frames_since_yolo = 0
+
                             t_yolo = time.perf_counter()
                             frame, boxes, track_ids, bowl_boxes = await loop.run_in_executor(
                                 self._executor, self._run_tracking, sc, state, frame
                             )
                             state.last_proc_time = time.perf_counter() - t_yolo
 
-                            # Update velocities from previous centers
+                            # EMA smoothing to reduce bbox jitter
+                            if len(boxes) > 0 and len(track_ids) > 0:
+                                boxes = self._smooth_boxes(state, boxes, track_ids)
+
+                            # Update velocities from smoothed centers
                             self._update_velocities(state, boxes, track_ids)
 
                             # Cache results for skip frames
@@ -562,18 +596,40 @@ class MultiStreamProcessor:
                             # Decide how many frames to skip based on processing load
                             if self.config.processing.enable_adaptive_skip:
                                 max_skip = self.config.processing.max_frame_skip
-                                # Scale skip count by priority (priority 1 = skip less)
                                 priority_factor = max(1, sc.priority)
                                 if state.last_proc_time > frame_interval * 2:
-                                    state.skip_counter = min(max_skip, priority_factor)
+                                    # Severely behind — skip maximum to catch up
+                                    state.skip_counter = max_skip
                                 elif state.last_proc_time > frame_interval:
-                                    state.skip_counter = min(max_skip, max(1, priority_factor - 1))
+                                    state.skip_counter = max(1, max_skip - priority_factor + 1)
                                 else:
                                     state.skip_counter = 0
 
                         # --- ReID correction (optional, only on YOLO frames) ---
                         if run_yolo and state.reid_tracker is not None and len(boxes) > 0:
-                            reid_result = state.reid_tracker.process(frame, boxes, track_ids)
+                            # --- Proximity lock: find track_ids whose bboxes are close ---
+                            PROXIMITY_LOCK_DIST = 250  # pixels — lock corrections when closer
+                            proximity_locked = set()
+                            box_centers = []
+                            for box in boxes:
+                                if hasattr(box, 'tolist'):
+                                    cx, cy = box.tolist()[:2]
+                                else:
+                                    cx, cy = box[0], box[1]
+                                box_centers.append((cx, cy))
+                            for i in range(len(box_centers)):
+                                for j in range(i + 1, len(box_centers)):
+                                    dx = box_centers[i][0] - box_centers[j][0]
+                                    dy = box_centers[i][1] - box_centers[j][1]
+                                    dist = (dx * dx + dy * dy) ** 0.5
+                                    if dist < PROXIMITY_LOCK_DIST:
+                                        proximity_locked.add(track_ids[i])
+                                        proximity_locked.add(track_ids[j])
+
+                            reid_result = state.reid_tracker.process(
+                                frame, boxes, track_ids,
+                                proximity_locked=proximity_locked,
+                            )
                             raw_corrected = reid_result['corrected_ids']
 
                             # ID stabilization: only accept correction after N consistent frames
@@ -581,6 +637,10 @@ class MultiStreamProcessor:
                             for orig_tid, corr_tid in zip(track_ids, raw_corrected):
                                 if orig_tid == corr_tid:
                                     # No correction — clear buffer and keep original
+                                    state.id_stable_buffer.pop(orig_tid, None)
+                                    stable_ids.append(orig_tid)
+                                elif orig_tid in proximity_locked:
+                                    # Proximity lock — reject correction, keep original
                                     state.id_stable_buffer.pop(orig_tid, None)
                                     stable_ids.append(orig_tid)
                                 else:
@@ -600,13 +660,50 @@ class MultiStreamProcessor:
                                         stable_ids.append(orig_tid)
 
                             track_ids = stable_ids
-                            if reid_result.get('global_ids'):
-                                for tid, gid in zip(track_ids, reid_result['global_ids']):
-                                    state.global_id_map[tid] = gid
 
-                        # --- Behavior detection (optional) ---
+                            # Global ID assignment — enforce uniqueness within frame
+                            if reid_result.get('global_ids'):
+                                # Collect gids already claimed by current-frame track_ids
+                                frame_gids_used = {}  # gid -> tid that owns it
+                                for tid in track_ids:
+                                    existing = state.global_id_map.get(tid)
+                                    if existing is not None:
+                                        frame_gids_used[existing] = tid
+
+                                for tid, gid in zip(track_ids, reid_result['global_ids']):
+                                    if tid in proximity_locked and tid in state.global_id_map:
+                                        continue  # Keep existing global_id when close
+                                    if gid is None:
+                                        continue
+                                    # Check if this gid is already taken by another track in this frame
+                                    owner = frame_gids_used.get(gid)
+                                    if owner is not None and owner != tid:
+                                        # Already assigned to a different track — skip
+                                        continue
+                                    # Revoke old gid from frame_gids_used if tid is switching
+                                    old_gid = state.global_id_map.get(tid)
+                                    if old_gid is not None and old_gid != gid:
+                                        if frame_gids_used.get(old_gid) == tid:
+                                            del frame_gids_used[old_gid]
+                                    state.global_id_map[tid] = gid
+                                    frame_gids_used[gid] = tid
+
+                                # Prune stale entries: remove tracks no longer in frame
+                                active_tids = set(track_ids)
+                                stale = [t for t in state.global_id_map if t not in active_tids]
+                                for t in stale:
+                                    del state.global_id_map[t]
+
+                        # --- Behavior detection (only on YOLO frames) ---
                         if needs_behavior and len(boxes) > 0:
-                            frame = self._run_behavior_detection(sc, state, frame, boxes, track_ids, bowl_boxes)
+                            if run_yolo:
+                                frame = await loop.run_in_executor(
+                                    self._executor, self._run_behavior_detection,
+                                    sc, state, frame, boxes, track_ids, bowl_boxes,
+                                )
+                            else:
+                                # Skip frames — draw cached labels without re-running detection
+                                frame = self._draw_cached_labels(state, frame, boxes, track_ids)
 
                         # Update stats
                         stats = self._stats.get_stream_stats(stream_id)
@@ -660,11 +757,16 @@ class MultiStreamProcessor:
                     elapsed_ms = (time.perf_counter() - t0) * 1000
                     stats.add_latency(elapsed_ms)
 
-                # --- Frame rate control ---
-                elapsed = time.perf_counter() - t0
-                sleep_time = frame_interval - elapsed
-                if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
+                # --- Frame rate control (cumulative — no sleep when behind) ---
+                next_frame_time += frame_interval
+                now = time.perf_counter()
+                if now < next_frame_time:
+                    await asyncio.sleep(next_frame_time - now)
+                else:
+                    # Cap debt after reconnection / long stall to avoid burst
+                    if now - next_frame_time > frame_interval * 5:
+                        next_frame_time = now
+                    await asyncio.sleep(0)
 
         except asyncio.CancelledError:
             pass
@@ -746,7 +848,13 @@ class MultiStreamProcessor:
 
     @staticmethod
     def _update_velocities(state: "StreamState", boxes, track_ids):
-        """Compute per-track velocity from previous centers for bbox interpolation."""
+        """Compute per-frame velocity from previous centers for bbox interpolation.
+
+        Divides displacement by the number of frames since last YOLO run
+        so that each skip frame shifts by exactly 1 frame worth of motion.
+        """
+        # frames_gap = 1 (no skip) or 1 + skipped frames since last YOLO
+        frames_gap = getattr(state, '_yolo_frame_gap', 1)
         new_centers = {}
         for tid, box in zip(track_ids, boxes):
             if hasattr(box, 'tolist'):
@@ -756,15 +864,49 @@ class MultiStreamProcessor:
             new_centers[tid] = (cx, cy)
             if tid in state.prev_centers:
                 px, py = state.prev_centers[tid]
-                state.last_velocities[tid] = (cx - px, cy - py)
+                state.last_velocities[tid] = (
+                    (cx - px) / frames_gap,
+                    (cy - py) / frames_gap,
+                )
             else:
                 state.last_velocities[tid] = (0.0, 0.0)
         state.prev_centers = new_centers
 
     @staticmethod
+    def _smooth_boxes(state: "StreamState", boxes, track_ids, alpha: float = 0.6):
+        """Apply EMA smoothing to reduce bbox jitter.
+
+        smoothed = alpha * new + (1 - alpha) * previous
+        alpha=0.6: responsive but stable. Lower = smoother but laggier.
+        Returns list of smoothed boxes (same type as input).
+        """
+        if not track_ids or len(boxes) == 0:
+            return boxes
+
+        is_tensor = hasattr(boxes[0], 'clone') if len(boxes) > 0 else False
+        smoothed = []
+        for tid, box in zip(track_ids, boxes):
+            curr = box.tolist() if hasattr(box, 'tolist') else list(box)
+            prev = state.smoothed_boxes.get(tid)
+            if prev is not None:
+                s = [alpha * curr[i] + (1 - alpha) * prev[i] for i in range(4)]
+            else:
+                s = curr
+            state.smoothed_boxes[tid] = s
+            smoothed.append(s)
+
+        # Clean up stale tracks
+        active = set(track_ids)
+        state.smoothed_boxes = {k: v for k, v in state.smoothed_boxes.items() if k in active}
+
+        if is_tensor:
+            return torch.tensor(smoothed, dtype=boxes[0].dtype)
+        return smoothed
+
+    @staticmethod
     def _interpolate_boxes(state: "StreamState"):
         """Shift cached bboxes by their velocity for skip frames."""
-        if not state.last_boxes or not state.last_track_ids:
+        if state.last_boxes is None or len(state.last_boxes) == 0 or not state.last_track_ids:
             return state.last_boxes
         interpolated = []
         for tid, box in zip(state.last_track_ids, state.last_boxes):
@@ -785,6 +927,66 @@ class MultiStreamProcessor:
             else:
                 state.last_boxes = interpolated
         return state.last_boxes
+
+    @staticmethod
+    def _draw_cached_labels(
+        state: "StreamState",
+        frame: np.ndarray,
+        boxes,
+        track_ids: list,
+    ) -> np.ndarray:
+        """Draw bboxes with cached behavior labels (lightweight, for skip frames)."""
+        COLOR_MAP = {
+            "fight": (0, 0, 255), "escape": (0, 255, 255),
+            "sleeping": (128, 0, 128), "bathroom": (235, 206, 135),
+            "feeding": (180, 105, 255), "playing": (0, 165, 255),
+            "inactive": (180, 0, 0), "normal": (0, 200, 0),
+            "none": (144, 238, 144),
+        }
+        sc = state.config
+        tid_to_bid = {}
+        used_bids = set()
+        for tid in track_ids:
+            gid = state.global_id_map.get(tid)
+            bid = gid if gid is not None else tid
+            if bid in used_bids:
+                bid = tid  # Duplicate global_id — fall back to track_id
+            used_bids.add(bid)
+            tid_to_bid[tid] = bid
+
+        for tid, box in zip(track_ids, boxes):
+            bid = tid_to_bid.get(tid, tid)
+            behavior = state.last_dog_behavior.get(bid, "normal")
+            if hasattr(box, 'tolist'):
+                xc, yc, w, h = box.tolist()
+            else:
+                xc, yc, w, h = box
+            pt1 = (int(xc - w / 2), int(yc - h / 2))
+            pt2 = (int(xc + w / 2), int(yc + h / 2))
+            color = COLOR_MAP.get(behavior, COLOR_MAP["none"])
+
+            gid = state.global_id_map.get(tid)
+            pet_name = state.global_id_names.get(gid) if gid else None
+            if pet_name:
+                label = f"{pet_name} {behavior}" if sc.show_track_id else behavior
+            elif sc.label_registered_only:
+                cv2.rectangle(frame, pt1, pt2, COLOR_MAP["none"], 1)
+                continue
+            elif not sc.show_track_id:
+                label = behavior
+            elif gid is not None:
+                label = f"G:{gid} {behavior}"
+            else:
+                label = f"#{tid} {behavior}"
+
+            cv2.rectangle(frame, pt1, pt2, color, 2)
+            if behavior != "normal" or pet_name:
+                display_label = pet_name if (behavior == "normal" and pet_name) else label
+                (tw, th), _ = cv2.getTextSize(display_label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                cv2.rectangle(frame, (pt1[0], pt1[1] - th - 10), (pt1[0] + tw, pt1[1]), color, -1)
+                cv2.putText(frame, display_label, (pt1[0], pt1[1] - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        return frame
 
     @staticmethod
     def _encode_jpeg(frame: np.ndarray, quality: int = 70) -> bytes:
@@ -903,25 +1105,9 @@ class MultiStreamProcessor:
                 )
             if state.reset_tracker:
                 state.reset_tracker = False
+                state.track_class_buffer.clear()
             ids = results[0].boxes.id
             cls = results[0].boxes.cls.cpu() if results[0].boxes.cls is not None else None
-
-            # Apply privacy filter from same results (person = class 0)
-            if sc.privacy and cls is not None:
-                all_xyxy_np = results[0].boxes.xyxy.cpu().numpy()
-                for i, c in enumerate(cls):
-                    if int(c) == 0:
-                        x1, y1, x2, y2 = map(int, all_xyxy_np[i])
-                        pad = 10
-                        x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
-                        x2 = min(frame.shape[1], x2 + pad)
-                        y2 = min(frame.shape[0], y2 + pad)
-                        if sc.privacy_method == "mosaic":
-                            frame = apply_mosaic(frame, x1, y1, x2, y2)
-                        elif sc.privacy_method == "black":
-                            frame = apply_black_box(frame, x1, y1, x2, y2)
-                        else:
-                            frame = apply_blur(frame, x1, y1, x2, y2)
 
             if ids is None:
                 state.no_detection_count += 1
@@ -930,19 +1116,96 @@ class MultiStreamProcessor:
                     state.reset_tracker = True
                     state.no_detection_count = 0
                 boxes, track_ids, bowl_boxes = [], [], []
+                # Privacy fallback: blur raw person detections even without tracking
+                if sc.privacy and cls is not None:
+                    all_xyxy_np = results[0].boxes.xyxy.cpu().numpy()
+                    person_boxes = []
+                    for i, c in enumerate(cls):
+                        if int(c) == 0:
+                            x1, y1, x2, y2 = map(int, all_xyxy_np[i])
+                            pad = 10
+                            x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+                            x2 = min(frame.shape[1], x2 + pad)
+                            y2 = min(frame.shape[0], y2 + pad)
+                            person_boxes.append([x1, y1, x2, y2])
+                            if sc.privacy_method == "mosaic":
+                                frame = apply_mosaic(frame, x1, y1, x2, y2)
+                            elif sc.privacy_method == "black":
+                                frame = apply_black_box(frame, x1, y1, x2, y2)
+                            else:
+                                frame = apply_blur(frame, x1, y1, x2, y2)
+                    state.last_person_boxes = person_boxes
+                elif sc.privacy:
+                    state.last_person_boxes = []
             else:
                 state.no_detection_count = 0
                 all_xywh = results[0].boxes.xywh.cpu()
                 all_xyxy = results[0].boxes.xyxy.cpu().numpy()
                 all_ids = results[0].boxes.id.int().cpu().tolist()
-                # Separate pets (class 1) and bowls (class 3), skip person (class 0)
                 all_conf = results[0].boxes.conf.cpu()
+
+                # --- Class stabilization per track ID ---
+                # Require 3 consecutive frames of new class before accepting change.
+                # Prevents person↔dog flickering from creating ghost tracks or
+                # dropping privacy filter.
+                CLASS_STABLE_FRAMES = 3
+                stable_cls = []
+                for i in range(len(cls)):
+                    tid = all_ids[i]
+                    raw_c = int(cls[i])
+                    buf = state.track_class_buffer.get(tid)
+                    if buf is None:
+                        # New track — accept class immediately
+                        state.track_class_buffer[tid] = {'cls': raw_c}
+                        stable_cls.append(raw_c)
+                    elif raw_c == buf['cls']:
+                        # Same as stabilized class — clear pending change
+                        buf.pop('candidate', None)
+                        buf.pop('count', None)
+                        stable_cls.append(raw_c)
+                    elif buf.get('candidate') == raw_c:
+                        buf['count'] = buf.get('count', 0) + 1
+                        if buf['count'] >= CLASS_STABLE_FRAMES:
+                            # Confirmed class change
+                            buf['cls'] = raw_c
+                            buf.pop('candidate', None)
+                            buf.pop('count', None)
+                            stable_cls.append(raw_c)
+                        else:
+                            # Not yet confirmed — keep old class
+                            stable_cls.append(buf['cls'])
+                    else:
+                        # New candidate class
+                        buf['candidate'] = raw_c
+                        buf['count'] = 1
+                        stable_cls.append(buf['cls'])
+
+                # Privacy filter using stabilized classes
+                if sc.privacy:
+                    person_boxes = []
+                    for i, c in enumerate(stable_cls):
+                        if c == 0:
+                            x1, y1, x2, y2 = map(int, all_xyxy[i])
+                            pad = 10
+                            x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+                            x2 = min(frame.shape[1], x2 + pad)
+                            y2 = min(frame.shape[0], y2 + pad)
+                            person_boxes.append([x1, y1, x2, y2])
+                            if sc.privacy_method == "mosaic":
+                                frame = apply_mosaic(frame, x1, y1, x2, y2)
+                            elif sc.privacy_method == "black":
+                                frame = apply_black_box(frame, x1, y1, x2, y2)
+                            else:
+                                frame = apply_blur(frame, x1, y1, x2, y2)
+                    state.last_person_boxes = person_boxes
+
+                # Separate pets (class 1) and bowls (class 3) using stabilized classes
                 pet_entries = []  # (conf, xywh, id)
                 bowl_boxes = []
-                for i, c in enumerate(cls):
-                    if int(c) == 1:
+                for i, c in enumerate(stable_cls):
+                    if c == 1:
                         pet_entries.append((float(all_conf[i]), all_xywh[i], all_ids[i]))
-                    elif int(c) == 3:
+                    elif c == 3:
                         bowl_boxes.append(all_xyxy[i])
 
                 # Deduplicate: keep highest confidence per track ID
@@ -994,19 +1257,28 @@ class MultiStreamProcessor:
                 self._event_sender.send(event)
 
         # Map track_ids → behavior_ids (use global_id when available)
+        # Enforce uniqueness: if two track_ids share the same global_id,
+        # only the first keeps it; the second falls back to raw track_id.
         behavior_ids = []
         tid_to_bid = {}
+        used_bids = set()
         for tid in track_ids:
             gid = state.global_id_map.get(tid)
             bid = gid if gid is not None else tid
+            if bid in used_bids:
+                # Duplicate global_id in this frame — fall back to track_id
+                bid = tid
+            used_bids.add(bid)
             behavior_ids.append(bid)
             tid_to_bid[tid] = bid
 
         def _resolve_dog_id(bid):
-            """Return global_id for API events, or None if not assigned."""
-            if bid in state.global_id_map.values():
-                return bid
-            return None
+            """Return dog ID for API events.
+
+            Always returns bid so events are sent for all detected pets,
+            whether they have a global_id or just a corrected track_id.
+            """
+            return bid
 
         # Prepare coordinates (keyed by behavior_id)
         for bid in behavior_ids:
@@ -1079,7 +1351,7 @@ class MultiStreamProcessor:
         # Fight detection
         fight_set = set()
         if sc.task_fight and state.close_count is not None:
-            fight_indices = detect_fight(
+            fight_indices, state.close_count, state.far_count = detect_fight(
                 x_arr, y_arr, track_ids, state.close_count, state.far_count,
                 sc.threshold, sc.reset_frames, sc.flag_frames,
                 last_w, last_h,
@@ -1229,6 +1501,9 @@ class MultiStreamProcessor:
                 if bid not in dog_behavior:
                     dog_behavior[bid] = "inactive"
 
+        # Cache behavior labels for skip frames
+        state.last_dog_behavior = dict(dog_behavior)
+
         # --- Draw bbox + label per dog ---
         registered_only = sc.label_registered_only
         for tid, box in zip(track_ids, boxes):
@@ -1261,11 +1536,12 @@ class MultiStreamProcessor:
                 label = f"#{tid} {behavior}"
 
             cv2.rectangle(frame, pt1, pt2, color, 2)
-            if behavior != "normal":
+            if behavior != "normal" or pet_name:
                 # Label background
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                display_label = pet_name if (behavior == "normal" and pet_name) else label
+                (tw, th), _ = cv2.getTextSize(display_label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
                 cv2.rectangle(frame, (pt1[0], pt1[1] - th - 10), (pt1[0] + tw, pt1[1]), color, -1)
-                cv2.putText(frame, label, (pt1[0], pt1[1] - 6),
+                cv2.putText(frame, display_label, (pt1[0], pt1[1] - 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         return frame

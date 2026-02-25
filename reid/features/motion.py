@@ -6,6 +6,7 @@ Motion Feature Extractors
 
 import cv2
 import numpy as np
+import time
 from typing import List, Dict, Optional, Tuple
 from collections import deque
 import logging
@@ -25,7 +26,9 @@ class MotionFeatureExtractor(FeatureExtractor):
                  include_velocity: bool = True,
                  include_acceleration: bool = True,
                  include_direction: bool = True,
-                 include_shape_change: bool = True):
+                 include_shape_change: bool = True,
+                 expected_fps: float = 30.0,
+                 gap_threshold_multiplier: float = 2.5):
         config = config or FeatureConfig(name="motion")
         super().__init__(config)
 
@@ -34,6 +37,10 @@ class MotionFeatureExtractor(FeatureExtractor):
         self.include_acceleration = include_acceleration
         self.include_direction = include_direction
         self.include_shape_change = include_shape_change
+
+        # 프레임 갭 감지 설정
+        self.expected_interval = 1.0 / max(expected_fps, 1.0)
+        self.gap_threshold = self.expected_interval * gap_threshold_multiplier
 
         # 특징 차원 계산
         dim = 0
@@ -99,7 +106,8 @@ class MotionFeatureExtractor(FeatureExtractor):
             'cx': cx, 'cy': cy, 'w': w, 'h': h,
             'aspect_ratio': w / h,
             'size': w * h,
-            'frame_idx': context.frame_idx
+            'frame_idx': context.frame_idx,
+            'timestamp': time.monotonic()
         }
 
         history.append(current_state)
@@ -143,30 +151,58 @@ class MotionFeatureExtractor(FeatureExtractor):
         # 정규화 (선택적 - 모션 특징은 스케일이 중요할 수 있음)
         feature_vec = self.normalize(feature_vec)
 
-        confidence = min(len(history) / self.history_length, 1.0)
+        # 갭 비율 기반 confidence 감소
+        gaps = self._detect_gaps(history)
+        gap_count = sum(gaps)
+        gap_ratio = gap_count / max(len(gaps), 1)
+        base_confidence = min(len(history) / self.history_length, 1.0)
+        confidence = base_confidence * (1.0 - 0.7 * gap_ratio)
 
         return FeatureOutput(
             feature=feature_vec,
             feature_type=self.feature_type,
             confidence=confidence,
-            metadata={'history_length': len(history)}
+            metadata={
+                'history_length': len(history),
+                'gap_count': gap_count,
+                'gap_ratio': gap_ratio
+            }
         )
 
+    def _detect_gaps(self, history: deque) -> List[bool]:
+        """연속 히스토리 엔트리 간 프레임 갭 감지.
+        gaps[i] = True → history[i]와 history[i+1] 사이에 프레임 손실 존재."""
+        if len(history) < 2:
+            return []
+        gaps = []
+        for i in range(len(history) - 1):
+            t0 = history[i].get('timestamp', 0)
+            t1 = history[i + 1].get('timestamp', 0)
+            dt_sec = max(t1 - t0, 0)
+            gaps.append(dt_sec > self.gap_threshold)
+        return gaps
+
     def _compute_velocities(self, history: deque) -> List[float]:
-        """속도 관련 특징 계산"""
+        """속도 관련 특징 계산 (프레임 갭 걸친 쌍은 스킵)"""
         if len(history) < 2:
             return [0.0, 0.0, 0.0, 0.0]
 
+        gaps = self._detect_gaps(history)
         velocities_x = []
         velocities_y = []
 
         for i in range(1, len(history)):
+            if gaps[i - 1]:
+                continue
             prev, curr = history[i - 1], history[i]
             dt = max(curr['frame_idx'] - prev['frame_idx'], 1)
             vx = (curr['cx'] - prev['cx']) / dt
             vy = (curr['cy'] - prev['cy']) / dt
             velocities_x.append(vx)
             velocities_y.append(vy)
+
+        if not velocities_x:
+            return [0.0, 0.0, 0.0, 0.0]
 
         speeds = [np.sqrt(vx ** 2 + vy ** 2) for vx, vy in zip(velocities_x, velocities_y)]
 
@@ -178,14 +214,17 @@ class MotionFeatureExtractor(FeatureExtractor):
         ]
 
     def _compute_accelerations(self, history: deque) -> List[float]:
-        """가속도 관련 특징 계산"""
+        """가속도 관련 특징 계산 (프레임 갭 걸친 트리플렛 스킵)"""
         if len(history) < 3:
             return [0.0, 0.0, 0.0]
 
+        gaps = self._detect_gaps(history)
         accelerations_x = []
         accelerations_y = []
 
         for i in range(2, len(history)):
+            if gaps[i - 2] or gaps[i - 1]:
+                continue
             h0, h1, h2 = history[i - 2], history[i - 1], history[i]
             dt1 = max(h1['frame_idx'] - h0['frame_idx'], 1)
             dt2 = max(h2['frame_idx'] - h1['frame_idx'], 1)
@@ -201,6 +240,9 @@ class MotionFeatureExtractor(FeatureExtractor):
             accelerations_x.append(ax)
             accelerations_y.append(ay)
 
+        if not accelerations_x:
+            return [0.0, 0.0, 0.0]
+
         mags = [np.sqrt(ax ** 2 + ay ** 2) for ax, ay in zip(accelerations_x, accelerations_y)]
 
         return [
@@ -210,13 +252,16 @@ class MotionFeatureExtractor(FeatureExtractor):
         ]
 
     def _compute_directions(self, history: deque) -> List[float]:
-        """이동 방향 관련 특징 계산"""
+        """이동 방향 관련 특징 계산 (프레임 갭 걸친 쌍 스킵)"""
         if len(history) < 2:
             return [0.0, 0.0, 0.0, 0.0]
 
+        gaps = self._detect_gaps(history)
         directions = []
 
         for i in range(1, len(history)):
+            if gaps[i - 1]:
+                continue
             prev, curr = history[i - 1], history[i]
             dx = curr['cx'] - prev['cx']
             dy = curr['cy'] - prev['cy']
@@ -285,7 +330,9 @@ class OpticalFlowFeatureExtractor(FeatureExtractor):
 
     def __init__(self, config: FeatureConfig = None,
                  grid_size: int = 4,
-                 flow_bins: int = 8):
+                 flow_bins: int = 8,
+                 expected_fps: float = 30.0,
+                 gap_threshold_multiplier: float = 2.5):
         config = config or FeatureConfig(name="optical_flow")
         super().__init__(config)
 
@@ -297,6 +344,9 @@ class OpticalFlowFeatureExtractor(FeatureExtractor):
 
         # 이전 프레임 저장
         self._prev_grays: Dict[int, np.ndarray] = {}
+        # 프레임 갭 감지용 타임스탬프
+        self._prev_timestamps: Dict[int, float] = {}
+        self.gap_threshold = (1.0 / max(expected_fps, 1.0)) * gap_threshold_multiplier
 
     @property
     def feature_dim(self) -> int:
@@ -316,11 +366,27 @@ class OpticalFlowFeatureExtractor(FeatureExtractor):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         gray = cv2.resize(gray, (64, 64))
 
+        now = time.monotonic()
+
         if track_id not in self._prev_grays:
             self._prev_grays[track_id] = gray
+            self._prev_timestamps[track_id] = now
             return self.get_zero_feature()
 
         prev_gray = self._prev_grays[track_id]
+        prev_ts = self._prev_timestamps.get(track_id, now)
+        dt_sec = max(now - prev_ts, 0)
+
+        # 프레임 갭 감지: 비연속 프레임 간 optical flow는 신뢰 불가
+        if dt_sec > self.gap_threshold:
+            self._prev_grays[track_id] = gray
+            self._prev_timestamps[track_id] = now
+            return FeatureOutput(
+                feature=np.zeros(self.feature_dim, dtype=np.float32),
+                feature_type=self.feature_type,
+                confidence=0.1,
+                metadata={'gap_detected': True, 'dt_sec': dt_sec}
+            )
 
         try:
             # Optical flow 계산 (Farneback)
@@ -361,6 +427,7 @@ class OpticalFlowFeatureExtractor(FeatureExtractor):
                     features.append(dom_direction)
 
             self._prev_grays[track_id] = gray
+            self._prev_timestamps[track_id] = now
 
             feature_vec = np.array(features, dtype=np.float32)
             feature_vec = self.normalize(feature_vec)
@@ -374,15 +441,18 @@ class OpticalFlowFeatureExtractor(FeatureExtractor):
         except Exception as e:
             self.logger.warning(f"Optical flow extraction failed: {e}")
             self._prev_grays[track_id] = gray
+            self._prev_timestamps[track_id] = now
             return self.get_zero_feature()
 
     def reset_state(self, track_ids: set = None):
         if track_ids is None:
             self._prev_grays.clear()
+            self._prev_timestamps.clear()
         else:
             active_ids = set(self._prev_grays.keys())
             for tid in active_ids - track_ids:
-                del self._prev_grays[tid]
+                self._prev_grays.pop(tid, None)
+                self._prev_timestamps.pop(tid, None)
 
 
 class TrajectoryFeatureExtractor(FeatureExtractor):
@@ -394,7 +464,9 @@ class TrajectoryFeatureExtractor(FeatureExtractor):
 
     def __init__(self, config: FeatureConfig = None,
                  history_length: int = 30,
-                 num_trajectory_points: int = 8):
+                 num_trajectory_points: int = 8,
+                 expected_fps: float = 30.0,
+                 gap_threshold_multiplier: float = 2.5):
         config = config or FeatureConfig(name="trajectory")
         super().__init__(config)
 
@@ -405,6 +477,9 @@ class TrajectoryFeatureExtractor(FeatureExtractor):
         self._feature_dim = num_trajectory_points * 2 + 3
 
         self._track_positions: Dict[int, deque] = {}
+
+        # 프레임 갭 감지 설정
+        self.gap_threshold = (1.0 / max(expected_fps, 1.0)) * gap_threshold_multiplier
 
     @property
     def feature_dim(self) -> int:
@@ -435,16 +510,31 @@ class TrajectoryFeatureExtractor(FeatureExtractor):
         if track_id not in self._track_positions:
             self._track_positions[track_id] = deque(maxlen=self.history_length)
 
-        self._track_positions[track_id].append((cx, cy))
+        self._track_positions[track_id].append((cx, cy, time.monotonic()))
 
-        positions = list(self._track_positions[track_id])
+        raw_positions = list(self._track_positions[track_id])
 
-        if len(positions) < 3:
+        if len(raw_positions) < 3:
             return self.get_zero_feature()
 
         try:
-            # 궤적 정규화 및 리샘플링
-            positions = np.array(positions)
+            # 프레임 갭 기준으로 연속 세그먼트 분할
+            segments = [[raw_positions[0]]]
+            for i in range(1, len(raw_positions)):
+                dt = raw_positions[i][2] - raw_positions[i - 1][2]
+                if dt > self.gap_threshold:
+                    segments.append([raw_positions[i]])
+                else:
+                    segments[-1].append(raw_positions[i])
+
+            # 가장 긴 연속 세그먼트 사용
+            best_segment = max(segments, key=len)
+
+            if len(best_segment) < 3:
+                return self.get_zero_feature()
+
+            # (cx, cy)만 추출
+            positions = np.array([(p[0], p[1]) for p in best_segment])
 
             # 중심으로 이동
             center = positions.mean(axis=0)
@@ -482,12 +572,19 @@ class TrajectoryFeatureExtractor(FeatureExtractor):
 
             features = self.normalize(features)
 
-            confidence = min(len(positions) / self.history_length, 1.0)
+            # 히스토리 커버리지 + 갭 분할 패널티 반영
+            coverage = min(len(best_segment) / self.history_length, 1.0)
+            frag_penalty = 1.0 - (len(segments) - 1) / max(len(raw_positions) - 1, 1)
+            confidence = coverage * max(frag_penalty, 0.3)
 
             return FeatureOutput(
                 feature=features,
                 feature_type=self.feature_type,
-                confidence=confidence
+                confidence=confidence,
+                metadata={
+                    'segment_count': len(segments),
+                    'best_segment_len': len(best_segment)
+                }
             )
 
         except Exception as e:

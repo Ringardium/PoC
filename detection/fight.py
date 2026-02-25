@@ -76,6 +76,18 @@ def detect_fight(
 
         tracked_ids.append((id_i, id_j))
 
+    # Auto-expand tensors if track IDs exceed current size
+    max_id = max((max(i, j) for i, j in tracked_ids), default=-1) if tracked_ids else -1
+    if max_id >= close_count.size(0):
+        new_size = max_id + 256  # pad to avoid frequent resizing
+        old_size = close_count.size(0)
+        new_close = torch.zeros((new_size, new_size))
+        new_far = torch.zeros((new_size, new_size))
+        new_close[:old_size, :old_size] = close_count
+        new_far[:old_size, :old_size] = far_count
+        close_count = new_close
+        far_count = new_far
+
     far_count += 1
     for i, j in tracked_ids:
         far_count[i, j] = 0
@@ -85,6 +97,6 @@ def detect_fight(
         close_count[i, j] += 1
         close_count[j, i] += 1
 
-    close_count = close_count * (far_count < reset_frames)
+    check = close_count * (far_count < reset_frames)
 
-    return triu_where(close_count > flag_frames, close_count)
+    return triu_where(check > flag_frames, check), close_count, far_count

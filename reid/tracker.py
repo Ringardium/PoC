@@ -45,7 +45,7 @@ try:
         LoggingEventHandler,
         IDSwitchHandler,
         HistogramFeatureExtractor,
-        AdaptiveAppearanceExtractor,
+        DINOv2FeatureExtractor,
         MotionFeatureExtractor,
         TrajectoryFeatureExtractor,
     )
@@ -79,7 +79,7 @@ class ReIDTrackerConfig:
     # ID 보정
     correction_enabled: bool = True
     correction_confidence_threshold: float = 0.7
-    correction_cooldown_frames: int = 15  # 보정 후 N프레임 동안 재보정 금지
+    correction_cooldown_frames: int = 30  # 보정 후 N프레임 동안 재보정 금지
 
     # 갤러리 관리
     gallery_max_size: int = 10
@@ -108,6 +108,7 @@ class TrackGallery:
     representative: np.ndarray = None
     last_seen_frame: int = 0
     disappeared_count: int = 0
+    last_bbox: Optional[Tuple] = None  # (x_center, y_center, w, h) — last known position
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def update(self, feature: np.ndarray, frame_idx: int, alpha: float = 0.3):
@@ -256,11 +257,18 @@ class ReIDTracker:
             # 외형 특징
             if self.config.use_appearance:
                 if self.config.use_deep_model:
-                    self.fusion_engine.register_extractor(
-                        'appearance',
-                        AdaptiveAppearanceExtractor(),
-                        weight=1.0
-                    )
+                    try:
+                        dino = DINOv2FeatureExtractor()
+                        self.fusion_engine.register_extractor(
+                            'appearance', dino, weight=1.0
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"DINOv2 init failed, falling back to Histogram: {e}")
+                        self.fusion_engine.register_extractor(
+                            'histogram',
+                            HistogramFeatureExtractor(),
+                            weight=1.0
+                        )
                 else:
                     self.fusion_engine.register_extractor(
                         'histogram',
@@ -327,10 +335,90 @@ class ReIDTracker:
         if self.event_bus:
             self.event_bus.subscribe_callback(event_type, callback)
 
+    def register_pet_profiles(self, profile_dir: str):
+        """Pet profile 레퍼런스 이미지를 자체 특징 추출기로 추출하여 GlobalIDManager에 등록.
+
+        이렇게 하면 런타임 특징과 동일한 차원의 벡터로 갤러리가 구성됩니다.
+        """
+        if not self.global_id_manager:
+            return
+
+        try:
+            import cv2
+            from pathlib import Path
+            from tools.pet_profiles import PetProfileStore
+            from reid.global_id import MultiFeatureGallery
+
+            store = PetProfileStore(profile_dir)
+            profiles = store.list_pets()
+            if not profiles:
+                self.logger.info("등록된 펫 프로필 없음")
+                return
+
+            base = Path(profile_dir)
+            registered = 0
+
+            for profile in profiles:
+                gid = profile.global_id
+                features_list = []
+
+                for img_rel in profile.reference_images:
+                    img_path = base / img_rel
+                    if not img_path.exists():
+                        continue
+                    img = cv2.imread(str(img_path))
+                    if img is None:
+                        continue
+
+                    # Use the same extraction pipeline as runtime
+                    crops = [img]
+                    if self.fusion_engine:
+                        from reid.features.base import TrackContext
+                        ctx = TrackContext(track_id=gid, bbox=(0, 0, img.shape[1], img.shape[0]))
+                        outputs = self.fusion_engine.extract_batch(crops, [ctx])
+                        if outputs and outputs[0].feature is not None:
+                            feat = outputs[0].feature
+                            norm = np.linalg.norm(feat)
+                            if norm > 1e-8:
+                                feat = feat / norm
+                            features_list.append(feat)
+                    elif self._legacy_extractor:
+                        feats = self._legacy_extractor.extract_features_batch(crops, [gid])
+                        if feats is not None and len(feats) > 0 and feats[0] is not None and len(feats[0]) > 0:
+                            feat = feats[0]
+                            norm = np.linalg.norm(feat)
+                            if norm > 1e-8:
+                                feat = feat / norm
+                            features_list.append(feat)
+
+                if not features_list:
+                    continue
+
+                rep_feature = np.mean(features_list, axis=0).astype(np.float32)
+                rep_feature = rep_feature / (np.linalg.norm(rep_feature) + 1e-8)
+
+                gallery = MultiFeatureGallery(global_id=gid, is_registered=True)
+                gallery.update('appearance', rep_feature, '__registered__')
+                self.global_id_manager.galleries[gid] = gallery
+                registered += 1
+                self.logger.info(f"펫 프로필 등록: {profile.name} -> G:{gid} (dim={len(rep_feature)})")
+
+            if self.global_id_manager.galleries:
+                max_gid = max(self.global_id_manager.galleries.keys())
+                self.global_id_manager._next_global_id = max(
+                    self.global_id_manager._next_global_id, max_gid + 1
+                )
+
+            self.logger.info(f"펫 프로필 {registered}개 등록 완료 (feature_dim={self.feature_dim})")
+
+        except Exception as e:
+            self.logger.warning(f"펫 프로필 등록 실패: {e}", exc_info=True)
+
     # === 메인 처리 ===
 
     def process(self, frame: np.ndarray, boxes: List, track_ids: List[int],
-                channel_id: str = "default") -> Dict:
+                channel_id: str = "default",
+                proximity_locked: set = None) -> Dict:
         """
         Re-ID 처리 메인 함수
 
@@ -339,6 +427,7 @@ class ReIDTracker:
             boxes: 바운딩 박스 리스트 [(x_center, y_center, w, h), ...]
             track_ids: 기존 트래커의 트랙 ID 리스트
             channel_id: 채널 ID (멀티채널용)
+            proximity_locked: 근접 잠금 트랙 ID 집합 — 갤러리 업데이트 동결
 
         Returns:
             {
@@ -391,11 +480,33 @@ class ReIDTracker:
             corrected_ids = track_ids
 
         # 3. 갤러리 업데이트
+        # ONLY update gallery for tracks where no correction was applied.
+        # Corrected tracks' galleries would get contaminated with wrong features
+        # (stream_processor may also reject the correction via stabilization buffer).
+        # Proximity-locked tracks are also frozen to prevent contamination from
+        # BotSORT ID swaps during close encounters.
         current_ids = set(corrected_ids)
-        for track_id, feature, conf in zip(corrected_ids, features, confidences):
-            if feature is not None and len(feature) > 0:
-                if conf >= self.config.correction_confidence_threshold:
-                    self._update_gallery(track_id, feature)
+        _prox = proximity_locked or set()
+        corrected_set = {c['new_id'] for c in corrections} if corrections else set()
+        for orig_id, corr_id, feature, conf, box in zip(track_ids, corrected_ids, features, confidences, boxes):
+            if feature is None or len(feature) == 0:
+                continue
+            if conf < self.config.correction_confidence_threshold:
+                continue
+            if orig_id != corr_id:
+                # Correction proposed — update bbox only, NOT features
+                if corr_id in self.galleries and box is not None:
+                    self.galleries[corr_id].last_bbox = tuple(box[:4])
+                continue
+            if corr_id in corrected_set:
+                # Another track was corrected TO this id — skip to avoid contamination
+                continue
+            if orig_id in _prox:
+                # Proximity locked — freeze gallery features, only update bbox
+                if corr_id in self.galleries and box is not None:
+                    self.galleries[corr_id].last_bbox = tuple(box[:4])
+                continue
+            self._update_gallery(corr_id, feature, bbox=box)
 
         # 4. 사라진 트랙 처리
         self._update_disappeared_tracks(current_ids)
@@ -405,6 +516,14 @@ class ReIDTracker:
             global_ids = []
             used_gids = set()  # Prevent same global_id assigned to multiple objects in one frame
             for track_id, feature, box in zip(corrected_ids, features, boxes):
+                if track_id in _prox:
+                    # Proximity locked — skip feature update, keep existing mapping
+                    key = (channel_id, track_id)
+                    existing = self.global_id_manager.local_to_global.get(key)
+                    if existing is not None:
+                        global_ids.append(existing)
+                        used_gids.add(existing)
+                        continue
                 gid = self.global_id_manager.get_global_id(
                     channel_id, track_id, feature, box,
                     exclude_gids=used_gids,
@@ -479,7 +598,8 @@ class ReIDTracker:
 
         return contexts
 
-    def _update_gallery(self, track_id: int, feature: np.ndarray):
+    def _update_gallery(self, track_id: int, feature: np.ndarray,
+                        bbox: Optional[Tuple] = None):
         """갤러리 업데이트"""
         if feature is None or len(feature) == 0:
             return
@@ -497,6 +617,8 @@ class ReIDTracker:
         self.galleries[track_id].update(
             feature, self._frame_idx, self.config.gallery_ema_alpha
         )
+        if bbox is not None:
+            self.galleries[track_id].last_bbox = tuple(bbox[:4])
 
         # 하위 호환용
         self.track_features[track_id] = self.galleries[track_id].representative
@@ -520,7 +642,7 @@ class ReIDTracker:
         # Track both original and already-corrected IDs to prevent duplicates
         used_ids = set(track_ids)
 
-        for i, (track_id, feature, conf) in enumerate(zip(track_ids, features, confidences)):
+        for i, (track_id, feature, conf, box) in enumerate(zip(track_ids, features, confidences, boxes)):
             if feature is None or len(feature) == 0:
                 continue
 
@@ -531,6 +653,8 @@ class ReIDTracker:
             if track_id in self._correction_cooldown:
                 continue
 
+            current_bbox = tuple(box[:4]) if box is not None and len(box) >= 4 else None
+
             # 기존 트랙과 비교
             if track_id in self.galleries:
                 existing = self.galleries[track_id].representative
@@ -538,8 +662,25 @@ class ReIDTracker:
                     similarity = self._compute_similarity(feature, existing)
 
                     if similarity < self.config.similarity_threshold:
+                        # Cross-match check: if the feature matches another ACTIVE
+                        # gallery better than its own, this is likely crop contamination
+                        # (overlapping bboxes near each other), not a real ID switch.
+                        best_active_sim = similarity
+                        for other_tid in track_ids:
+                            if other_tid == track_id:
+                                continue
+                            og = self.galleries.get(other_tid)
+                            if og and og.representative is not None:
+                                s = self._compute_similarity(feature, og.representative)
+                                if s > best_active_sim:
+                                    best_active_sim = s
+                        if best_active_sim > similarity:
+                            # Feature resembles a nearby active track more — crop contamination
+                            continue
+
                         correction = self._try_match_disappeared(
-                            i, track_id, feature, used_ids
+                            i, track_id, feature, used_ids,
+                            current_bbox=current_bbox,
                         )
                         if correction:
                             corrected_ids[i] = correction['new_id']
@@ -547,7 +688,10 @@ class ReIDTracker:
                             self._correction_cooldown[correction['new_id']] = self.config.correction_cooldown_frames
                             corrections.append(correction)
             else:
-                correction = self._try_reidentify(i, track_id, feature, used_ids)
+                correction = self._try_reidentify(
+                    i, track_id, feature, used_ids,
+                    current_bbox=current_bbox,
+                )
                 if correction:
                     corrected_ids[i] = correction['new_id']
                     used_ids.add(correction['new_id'])
@@ -556,10 +700,33 @@ class ReIDTracker:
 
         return corrected_ids, corrections
 
+    @staticmethod
+    def _bbox_center_distance(box1, box2) -> float:
+        """Compute Euclidean distance between bbox centers."""
+        if box1 is None or box2 is None:
+            return 0.0
+        cx1, cy1 = float(box1[0]), float(box1[1])
+        cx2, cy2 = float(box2[0]), float(box2[1])
+        return ((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2) ** 0.5
+
+    @staticmethod
+    def _distance_penalty(dist: float, max_dist: float = 300.0) -> float:
+        """Convert distance to a [0, 1] penalty. 0 = no penalty, 1 = full penalty.
+
+        Uses sigmoid-like ramp: penalty is small when close, large when far.
+        ``max_dist`` is the distance at which penalty ≈ 0.7.
+        """
+        if dist <= 0:
+            return 0.0
+        # Smooth ramp: penalty = 1 - exp(-dist^2 / (2 * sigma^2))
+        sigma = max_dist * 0.6
+        return 1.0 - np.exp(-(dist ** 2) / (2 * sigma ** 2))
+
     def _try_match_disappeared(self, idx: int, track_id: int,
                                 feature: np.ndarray,
-                                current_ids: set) -> Optional[Dict]:
-        """사라진 트랙에서 매칭 시도"""
+                                current_ids: set,
+                                current_bbox=None) -> Optional[Dict]:
+        """사라진 트랙에서 매칭 시도 (위치 거리 패널티 포함)"""
         disappeared_galleries = {
             tid: g for tid, g in self.galleries.items()
             if tid not in current_ids and
@@ -571,20 +738,27 @@ class ReIDTracker:
             return None
 
         best_match = None
-        best_sim = 0.0
+        best_score = 0.0
 
         for tid, gallery in disappeared_galleries.items():
             sim = self._compute_similarity(feature, gallery.representative)
-            if sim > best_sim:
-                best_sim = sim
+            # Apply distance penalty: reduce similarity for far-away tracks
+            if current_bbox is not None and gallery.last_bbox is not None:
+                dist = self._bbox_center_distance(current_bbox, gallery.last_bbox)
+                penalty = self._distance_penalty(dist)
+                score = sim * (1.0 - 0.5 * penalty)  # max 50% penalty from distance
+            else:
+                score = sim
+            if score > best_score:
+                best_score = score
                 best_match = tid
 
-        if best_match is not None and best_sim >= self.config.similarity_threshold:
+        if best_match is not None and best_score >= self.config.similarity_threshold:
             correction = {
                 'index': idx,
                 'old_id': track_id,
                 'new_id': best_match,
-                'similarity': best_sim,
+                'similarity': best_score,
                 'reason': 'switch_detected'
             }
 
@@ -599,15 +773,16 @@ class ReIDTracker:
                     data=correction
                 ))
 
-            self.logger.info(f"ID 보정: {track_id} -> {best_match} (유사도: {best_sim:.3f})")
+            self.logger.info(f"ID 보정: {track_id} -> {best_match} (유사도: {best_score:.3f})")
             return correction
 
         return None
 
     def _try_reidentify(self, idx: int, track_id: int,
                         feature: np.ndarray,
-                        current_ids: set) -> Optional[Dict]:
-        """재식별 시도"""
+                        current_ids: set,
+                        current_bbox=None) -> Optional[Dict]:
+        """재식별 시도 (위치 거리 패널티 포함)"""
         disappeared = {
             tid: g for tid, g in self.galleries.items()
             if tid not in current_ids and
@@ -620,20 +795,27 @@ class ReIDTracker:
             return None
 
         best_match = None
-        best_sim = 0.0
+        best_score = 0.0
 
         for tid, gallery in disappeared.items():
             sim = self._compute_similarity(feature, gallery.representative)
-            if sim > best_sim:
-                best_sim = sim
+            # Apply distance penalty
+            if current_bbox is not None and gallery.last_bbox is not None:
+                dist = self._bbox_center_distance(current_bbox, gallery.last_bbox)
+                penalty = self._distance_penalty(dist)
+                score = sim * (1.0 - 0.5 * penalty)
+            else:
+                score = sim
+            if score > best_score:
+                best_score = score
                 best_match = tid
 
-        if best_match is not None and best_sim >= self.config.similarity_threshold:
+        if best_match is not None and best_score >= self.config.similarity_threshold:
             correction = {
                 'index': idx,
                 'old_id': track_id,
                 'new_id': best_match,
-                'similarity': best_sim,
+                'similarity': best_score,
                 'reason': 're_identified'
             }
 
@@ -647,7 +829,7 @@ class ReIDTracker:
                     data=correction
                 ))
 
-            self.logger.info(f"재식별: {track_id} -> {best_match} (유사도: {best_sim:.3f})")
+            self.logger.info(f"재식별: {track_id} -> {best_match} (유사도: {best_score:.3f})")
             return correction
 
         return None

@@ -32,8 +32,8 @@
       "task_active": true,
       "threshold": 0.3,
       "fight_speed_threshold": 5.0,
-      "inert_threshold": 1.5,
-      "inert_frames": 100,
+      "inert_threshold": 1.0,
+      "inert_frames": 150,
       "active_threshold": 800.0,
       "active_frames": 90,
       "active_speed_threshold": 5.0,
@@ -75,5 +75,6 @@
   "hls_s3_prefix": "hls/live",
   "clip_s3_prefix": "clips/events",
   "clip_pre_seconds": 2.0,
-  "clip_post_seconds": 2.0
+  "clip_post_seconds": 2.0,
+  "cdn_base_url": null
 }

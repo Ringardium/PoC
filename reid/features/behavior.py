@@ -8,6 +8,7 @@ Behavior Feature Extractors
 
 import cv2
 import numpy as np
+import time
 from typing import List, Dict, Optional, Tuple
 from collections import deque
 import logging
@@ -23,12 +24,17 @@ class ActivityLevelExtractor(FeatureExtractor):
     """
 
     def __init__(self, config: FeatureConfig = None,
-                 history_length: int = 30):
+                 history_length: int = 30,
+                 expected_fps: float = 30.0,
+                 gap_threshold_multiplier: float = 2.5):
         config = config or FeatureConfig(name="activity_level")
         super().__init__(config)
 
         self.history_length = history_length
         self._feature_dim = 8  # 활동 수준 관련 특징들
+
+        # 프레임 갭 감지 설정
+        self.gap_threshold = (1.0 / max(expected_fps, 1.0)) * gap_threshold_multiplier
 
         # 트랙별 히스토리
         self._track_histories: Dict[int, deque] = {}
@@ -68,7 +74,8 @@ class ActivityLevelExtractor(FeatureExtractor):
         history = self._track_histories[track_id]
         history.append({
             'cx': cx, 'cy': cy, 'area': area,
-            'frame_idx': context.frame_idx
+            'frame_idx': context.frame_idx,
+            'timestamp': time.monotonic()
         })
 
         if len(history) < 5:
@@ -81,20 +88,35 @@ class ActivityLevelExtractor(FeatureExtractor):
         # 활동 수준 특징 계산
         features = self._compute_activity_features(history)
 
+        # 갭 비율 기반 confidence 감소
+        timestamps = [h.get('timestamp', 0) for h in history]
+        gap_count = sum(
+            1 for i in range(1, len(timestamps))
+            if timestamps[i] - timestamps[i - 1] > self.gap_threshold
+        )
+        gap_ratio = gap_count / max(len(timestamps) - 1, 1)
+        base_confidence = min(len(history) / self.history_length, 1.0)
+        confidence = base_confidence * (1.0 - 0.7 * gap_ratio)
+
         return FeatureOutput(
             feature=features,
             feature_type=self.feature_type,
-            confidence=min(len(history) / self.history_length, 1.0)
+            confidence=confidence,
+            metadata={'gap_count': gap_count, 'gap_ratio': gap_ratio}
         )
 
     def _compute_activity_features(self, history: deque) -> np.ndarray:
-        """활동 수준 특징 계산"""
+        """활동 수준 특징 계산 (프레임 갭 걸친 쌍 스킵)"""
         positions = [(h['cx'], h['cy']) for h in history]
         areas = [h['area'] for h in history]
+        timestamps = [h.get('timestamp', 0) for h in history]
 
-        # 이동 거리들
+        # 이동 거리들 (갭 걸친 쌍 스킵)
         displacements = []
         for i in range(1, len(positions)):
+            dt_sec = timestamps[i] - timestamps[i - 1]
+            if dt_sec > self.gap_threshold:
+                continue
             dx = positions[i][0] - positions[i - 1][0]
             dy = positions[i][1] - positions[i - 1][1]
             displacements.append(np.sqrt(dx ** 2 + dy ** 2))
@@ -107,7 +129,7 @@ class ActivityLevelExtractor(FeatureExtractor):
             sum(d > 10 for d in displacements) / max(len(displacements), 1),  # 활발한 이동 비율
             np.mean(areas) / 10000,  # 평균 크기 (정규화)
             np.std(areas) / 1000 if len(areas) > 1 else 0,  # 크기 변동성
-            self._compute_direction_entropy(positions),  # 방향 엔트로피
+            self._compute_direction_entropy(positions, timestamps),  # 방향 엔트로피
             self._compute_territory_size(positions)  # 활동 영역 크기
         ]
 
@@ -116,14 +138,19 @@ class ActivityLevelExtractor(FeatureExtractor):
 
         return self.normalize(feature_vec)
 
-    def _compute_direction_entropy(self, positions: List[Tuple]) -> float:
-        """이동 방향 엔트로피 (불규칙할수록 높음)"""
+    def _compute_direction_entropy(self, positions: List[Tuple],
+                                    timestamps: List[float] = None) -> float:
+        """이동 방향 엔트로피 (불규칙할수록 높음, 프레임 갭 걸친 쌍 스킵)"""
         if len(positions) < 3:
             return 0.0
 
         # 방향 각도 계산
         angles = []
         for i in range(1, len(positions)):
+            if timestamps and len(timestamps) > i:
+                dt_sec = timestamps[i] - timestamps[i - 1]
+                if dt_sec > self.gap_threshold:
+                    continue
             dx = positions[i][0] - positions[i - 1][0]
             dy = positions[i][1] - positions[i - 1][1]
             if abs(dx) > 1e-6 or abs(dy) > 1e-6:
@@ -216,7 +243,7 @@ class PostureFeatureExtractor(FeatureExtractor):
             self._track_histories[track_id] = deque(maxlen=self.history_length)
 
         history = self._track_histories[track_id]
-        history.append({'aspect_ratio': aspect_ratio, 'size': size})
+        history.append({'aspect_ratio': aspect_ratio, 'size': size, 'timestamp': time.monotonic()})
 
         # 자세 특징 계산
         features = self._compute_posture_features(history)

@@ -405,13 +405,15 @@ class AdaptiveAppearanceExtractor(FeatureExtractor):
     def __init__(self, config: FeatureConfig = None,
                  use_deep_model: bool = True,
                  switch_threshold: float = 0.3,
-                 stable_frames: int = 5):
+                 stable_frames: int = 10,
+                 deep_refresh_interval: int = 15):
         config = config or FeatureConfig(name="adaptive_appearance")
         super().__init__(config)
 
         self.use_deep_model = use_deep_model and TORCH_AVAILABLE
         self.switch_threshold = switch_threshold
         self.stable_frames = stable_frames
+        self._deep_refresh_interval = deep_refresh_interval
 
         # 추출기 초기화
         self.fast_extractor = HistogramFeatureExtractor()
@@ -446,18 +448,27 @@ class AdaptiveAppearanceExtractor(FeatureExtractor):
         return "appearance"
 
     def _should_use_deep(self, track_id: int, fast_feature: np.ndarray) -> bool:
-        """딥러닝 모델 사용 여부 결정"""
+        """딥러닝 모델 사용 여부 결정
+
+        Always returns True for:
+        - New tracks
+        - ID switch suspected (fast feature similarity drop)
+        - Every ``deep_refresh_interval`` frames (keeps gallery accurate)
+        - Tracks with fewer than ``stable_frames`` observations
+        """
         if self.deep_extractor is None:
             return False
 
         if track_id not in self._track_states:
             self._track_states[track_id] = {
                 'prev_feature': fast_feature,
-                'stable_count': 0
+                'stable_count': 0,
+                'frame_count': 0,
             }
             return True  # 새 트랙은 deep model 사용
 
         state = self._track_states[track_id]
+        state['frame_count'] = state.get('frame_count', 0) + 1
 
         if state['prev_feature'] is not None:
             similarity = float(np.dot(fast_feature, state['prev_feature']))
@@ -471,6 +482,11 @@ class AdaptiveAppearanceExtractor(FeatureExtractor):
                 state['stable_count'] += 1
 
         state['prev_feature'] = fast_feature
+
+        # Periodically refresh deep features even for stable tracks
+        if state['frame_count'] % self._deep_refresh_interval == 0:
+            return True
+
         return state['stable_count'] < self.stable_frames
 
     def extract(self, image: np.ndarray, context: TrackContext = None) -> FeatureOutput:

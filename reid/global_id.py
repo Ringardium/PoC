@@ -72,7 +72,14 @@ class MultiFeatureGallery:
     last_seen: float = 0.0
     total_appearances: int = 0
     channels_seen: set = field(default_factory=set)
+    last_bbox: Optional[tuple] = None  # (x_center, y_center, w, h)
+    is_registered: bool = False  # True for pet profile galleries — never expire
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Size profile — accumulated bbox geometry for size-based matching
+    size_history: deque = field(default_factory=lambda: deque(maxlen=50))
+    # Cached running stats (updated on each update_size_profile call)
+    _size_stats: Dict[str, float] = field(default_factory=dict)
 
     # 하위 호환용 프로퍼티
     @property
@@ -102,6 +109,47 @@ class MultiFeatureGallery:
             norm = np.linalg.norm(self.representatives[feature_type])
             if norm > 1e-7:
                 self.representatives[feature_type] /= norm
+
+    def update_size_profile(self, bbox: tuple):
+        """bbox로부터 크기 프로필 업데이트.
+
+        Args:
+            bbox: (x_center, y_center, w, h) or (x1, y1, x2, y2)
+        """
+        if bbox is None or len(bbox) < 4:
+            return
+
+        x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+        # Detect format: if x2 > x1, treat as (x1,y1,x2,y2)
+        if x2 > x1 and y2 > y1:
+            w = x2 - x1
+            h = y2 - y1
+            y_center = (y1 + y2) / 2
+        else:
+            # (cx, cy, w, h) format
+            w = x2 if x2 > 0 else 1
+            h = y2 if y2 > 0 else 1
+            y_center = y1
+
+        aspect_ratio = w / max(h, 1.0)
+        area = w * h
+
+        self.size_history.append({
+            'aspect_ratio': aspect_ratio,
+            'area': area,
+            'y_center': y_center,
+        })
+
+        # Recompute running stats
+        if len(self.size_history) >= 3:
+            ars = [s['aspect_ratio'] for s in self.size_history]
+            areas = [s['area'] for s in self.size_history]
+            self._size_stats = {
+                'ar_mean': float(np.mean(ars)),
+                'ar_std': float(np.std(ars)),
+                'area_mean': float(np.mean(areas)),
+                'area_std': float(np.std(areas)),
+            }
 
     def update_single(self, feature: np.ndarray, channel_id: str):
         """단일 특징 업데이트 (하위 호환)"""
@@ -257,7 +305,7 @@ class SingleFeatureMatching(GalleryMatchingStrategy):
 @dataclass
 class GlobalIDManagerConfig:
     """Global ID Manager 설정"""
-    similarity_threshold: float = 0.6
+    similarity_threshold: float = 0.7
     max_gallery_size: int = 100
     inactive_timeout: float = 300.0
     ema_alpha: float = 0.1
@@ -365,6 +413,75 @@ class GlobalIDManager:
         """이벤트 버스 설정"""
         self.event_bus = event_bus
 
+    def register_pet_profiles(self, profile_dir: str, feature_extractor=None):
+        """PetProfileStore의 레퍼런스 이미지로 갤러리를 사전 등록.
+
+        등록된 펫은 pet profile의 global_id를 그대로 사용하므로,
+        런타임 매칭 시 pet_name이 올바르게 표시됩니다.
+
+        Args:
+            profile_dir: PetProfileStore 기본 디렉토리 (e.g. "references")
+            feature_extractor: 특징 추출 함수 (crop_image -> np.ndarray).
+                None이면 ColorHistogramReID를 사용.
+        """
+        try:
+            from tools.pet_profiles import PetProfileStore
+            store = PetProfileStore(profile_dir)
+            profiles = store.list_pets()
+            if not profiles:
+                self.logger.info("등록된 펫 프로필 없음")
+                return
+
+            # 기본 특징 추출기
+            if feature_extractor is None:
+                from reid.extractor import ColorHistogramReID
+                extractor = ColorHistogramReID()
+                feature_extractor = extractor.extract_features
+
+            import cv2
+            from pathlib import Path
+            base = Path(profile_dir)
+
+            registered = 0
+            for profile in profiles:
+                gid = profile.global_id
+                features_list = []
+                for img_rel in profile.reference_images:
+                    img_path = base / img_rel
+                    if not img_path.exists():
+                        continue
+                    img = cv2.imread(str(img_path))
+                    if img is None:
+                        continue
+                    feat = feature_extractor(img)
+                    if feat is not None and len(feat) > 0:
+                        feat = feat / (np.linalg.norm(feat) + 1e-8)
+                        features_list.append(feat)
+
+                if not features_list:
+                    continue
+
+                # 대표 특징 = 평균
+                rep_feature = np.mean(features_list, axis=0).astype(np.float32)
+                rep_feature = rep_feature / (np.linalg.norm(rep_feature) + 1e-8)
+
+                # 갤러리에 등록 — is_registered=True로 만료 방지
+                gallery = MultiFeatureGallery(global_id=gid, is_registered=True)
+                gallery.update('appearance', rep_feature, '__registered__')
+                self.galleries[gid] = gallery
+                registered += 1
+                self.logger.info(f"펫 프로필 등록: {profile.name} -> G:{gid}")
+
+            # _next_global_id를 등록된 ID 이후로 설정
+            if self.galleries:
+                max_registered = max(self.galleries.keys())
+                self._next_global_id = max(self._next_global_id, max_registered + 1)
+
+            self.logger.info(f"펫 프로필 {registered}개 사전 등록 완료 (next_id={self._next_global_id})")
+
+        except Exception as e:
+            self.logger.warning(f"펫 프로필 로드 실패: {e}")
+
     def _get_next_global_id(self) -> int:
         """스레드 안전한 글로벌 ID 생성"""
         with self._lock:
@@ -395,11 +512,11 @@ class GlobalIDManager:
         features = {'appearance': feature}
         exclude_ids = {exclude_global_id} if exclude_global_id else set()
 
-        # 활성 갤러리만 대상
+        # 활성 갤러리만 대상 (등록된 펫은 항상 활성)
         current_time = time.time()
         active_galleries = {
             gid: gallery for gid, gallery in self.galleries.items()
-            if (current_time - gallery.last_seen) < self.inactive_timeout
+            if gallery.is_registered or (current_time - gallery.last_seen) < self.inactive_timeout
         }
 
         return self.matching_strategy.match(
@@ -463,11 +580,13 @@ class GlobalIDManager:
                 )
             else:
                 if global_id in self.galleries:
-                    self._update_gallery(global_id, features, channel_id)
+                    self._update_gallery(global_id, features, channel_id, box)
                 return global_id
 
         # 새로운 로컬 ID - 갤러리에서 매칭 시도
-        matched_gid, similarity = self._find_matching_gallery_multi(features, exclude_gids)
+        matched_gid, similarity = self._find_matching_gallery_multi(
+            features, exclude_gids, query_bbox=box
+        )
 
         if matched_gid is not None:
             global_id = matched_gid
@@ -506,32 +625,136 @@ class GlobalIDManager:
         self.global_to_local[global_id].append(key)
 
         # 갤러리 업데이트
-        self._update_gallery(global_id, features, channel_id)
+        self._update_gallery(global_id, features, channel_id, box)
 
         return global_id
 
+    @staticmethod
+    def _bbox_distance(box1, box2) -> float:
+        """Center distance between two bboxes."""
+        if box1 is None or box2 is None:
+            return 0.0
+        return ((float(box1[0]) - float(box2[0])) ** 2 +
+                (float(box1[1]) - float(box2[1])) ** 2) ** 0.5
+
+    @staticmethod
+    def _distance_penalty(dist: float, max_dist: float = 300.0) -> float:
+        """Gaussian distance penalty in [0, 1]. 0 = close, 1 = far."""
+        if dist <= 0:
+            return 0.0
+        sigma = max_dist * 0.6
+        return 1.0 - np.exp(-(dist ** 2) / (2 * sigma ** 2))
+
+    @staticmethod
+    def _size_similarity(query_bbox: tuple, gallery: 'MultiFeatureGallery') -> float:
+        """Query bbox와 갤러리 크기 프로필 간 유사도 (0~1).
+
+        aspect ratio는 깊이에 불변하므로 주력으로, 면적은 보조로 사용.
+        갤러리에 통계가 충분하지 않으면 1.0 반환 (패널티 없음).
+        """
+        if not gallery._size_stats or query_bbox is None or len(query_bbox) < 4:
+            return 1.0  # 데이터 부족 → 중립
+
+        x1, y1, x2, y2 = float(query_bbox[0]), float(query_bbox[1]), float(query_bbox[2]), float(query_bbox[3])
+        if x2 > x1 and y2 > y1:
+            w = x2 - x1
+            h = y2 - y1
+        else:
+            w = x2 if x2 > 0 else 1
+            h = y2 if y2 > 0 else 1
+
+        query_ar = w / max(h, 1.0)
+        query_area = w * h
+
+        stats = gallery._size_stats
+        ar_mean = stats['ar_mean']
+        ar_std = max(stats['ar_std'], 0.05)  # 최소 std 설정
+        area_mean = stats['area_mean']
+        area_std = max(stats['area_std'], area_mean * 0.1)  # 최소 10% CV
+
+        # Aspect ratio 유사도 (Gaussian, 주력 — 깊이 불변)
+        ar_diff = abs(query_ar - ar_mean)
+        ar_sim = float(np.exp(-(ar_diff ** 2) / (2 * ar_std ** 2)))
+
+        # 면적 유사도 (Gaussian, 보조 — 깊이 의존적이므로 느슨하게)
+        area_diff = abs(query_area - area_mean)
+        # 면적은 3x std 허용 (카메라 깊이 변동 수용)
+        area_sim = float(np.exp(-(area_diff ** 2) / (2 * (area_std * 3) ** 2)))
+
+        # 가중 결합: aspect_ratio 70%, area 30%
+        combined = 0.7 * ar_sim + 0.3 * area_sim
+        return combined
+
     def _find_matching_gallery_multi(self, features: Dict[str, np.ndarray],
-                                      exclude_gids: set = None) -> Tuple[Optional[int], float]:
-        """다중 특징으로 갤러리 매칭"""
+                                      exclude_gids: set = None,
+                                      query_bbox: tuple = None) -> Tuple[Optional[int], float]:
+        """다중 특징으로 갤러리 매칭 (위치 거리 패널티 포함)"""
         if not features:
             return None, 0.0
 
         current_time = time.time()
         active_galleries = {
             gid: gallery for gid, gallery in self.galleries.items()
-            if (current_time - gallery.last_seen) < self.inactive_timeout
+            if (gallery.is_registered or (current_time - gallery.last_seen) < self.inactive_timeout)
             and (exclude_gids is None or gid not in exclude_gids)
         }
 
         if not active_galleries:
             return None, 0.0
 
-        return self.matching_strategy.match(
-            features, active_galleries, self.similarity_threshold
+        matched_gid, raw_sim = self.matching_strategy.match(
+            features, active_galleries, 0.0  # get raw score, apply threshold after penalty
         )
 
+        if matched_gid is None:
+            return None, 0.0
+
+        # Apply distance penalty + size similarity
+        final_sim = raw_sim
+        gallery = active_galleries.get(matched_gid)
+        if query_bbox is not None and gallery:
+            if gallery.last_bbox is not None:
+                dist = self._bbox_distance(query_bbox, gallery.last_bbox)
+                penalty = self._distance_penalty(dist)
+                final_sim = raw_sim * (1.0 - 0.5 * penalty)
+            # Size similarity: penalize mismatched body proportions
+            size_sim = self._size_similarity(query_bbox, gallery)
+            final_sim = final_sim * (0.7 + 0.3 * size_sim)  # 최대 30% 감소
+
+        if final_sim >= self.similarity_threshold:
+            return matched_gid, final_sim
+
+        # If best match failed after penalty, try others with distance + size awareness
+        best_gid = None
+        best_score = 0.0
+        for gid, gal in active_galleries.items():
+            if gid == matched_gid:
+                continue
+            # Compute similarity per gallery
+            sim_result = self.matching_strategy.match(
+                features, {gid: gal}, 0.0
+            )
+            if sim_result[0] is None:
+                continue
+            score = sim_result[1]
+            if query_bbox is not None:
+                if gal.last_bbox is not None:
+                    dist = self._bbox_distance(query_bbox, gal.last_bbox)
+                    penalty = self._distance_penalty(dist)
+                    score = score * (1.0 - 0.5 * penalty)
+                size_sim = self._size_similarity(query_bbox, gal)
+                score = score * (0.7 + 0.3 * size_sim)
+            if score > best_score:
+                best_score = score
+                best_gid = gid
+
+        if best_gid is not None and best_score >= self.similarity_threshold:
+            return best_gid, best_score
+
+        return None, 0.0
+
     def _update_gallery(self, global_id: int, features: Dict[str, np.ndarray],
-                        channel_id: str):
+                        channel_id: str, box: tuple = None):
         """갤러리 업데이트"""
         if global_id not in self.galleries:
             return
@@ -543,6 +766,10 @@ class GlobalIDManager:
                 weight = self.config.feature_weights.get(feat_type, 1.0)
                 gallery.update(feat_type, feature, channel_id,
                               alpha=self.config.ema_alpha, weight=weight)
+
+        if box is not None:
+            gallery.last_bbox = tuple(box[:4])
+            gallery.update_size_profile(box)
 
     def _emit_event(self, event_type: str, track_id: int, data: dict):
         """이벤트 발행 (이벤트 버스 설정시)"""
@@ -577,10 +804,11 @@ class GlobalIDManager:
         """오래된 데이터 정리"""
         current_time = time.time()
 
-        # 비활성 갤러리 제거
+        # 비활성 갤러리 제거 (등록된 펫 프로필은 보존)
         inactive_gids = [
             gid for gid, gallery in self.galleries.items()
-            if (current_time - gallery.last_seen) > self.inactive_timeout
+            if not gallery.is_registered
+            and (current_time - gallery.last_seen) > self.inactive_timeout
         ]
 
         for gid in inactive_gids:
@@ -595,14 +823,14 @@ class GlobalIDManager:
             if self.event_bus:
                 self._emit_event('TRACK_DELETED', gid, {})
 
-        # 갤러리 크기 제한
+        # 갤러리 크기 제한 (등록된 펫은 제거하지 않음)
         if len(self.galleries) > self.max_gallery_size:
-            sorted_gids = sorted(
-                self.galleries.keys(),
-                key=lambda gid: self.galleries[gid].last_seen
-            )
+            removable = [
+                gid for gid, g in self.galleries.items() if not g.is_registered
+            ]
+            removable.sort(key=lambda gid: self.galleries[gid].last_seen)
 
-            to_remove = sorted_gids[:len(self.galleries) - self.max_gallery_size]
+            to_remove = removable[:len(self.galleries) - self.max_gallery_size]
             for gid in to_remove:
                 if gid in self.global_to_local:
                     for key in self.global_to_local[gid]:

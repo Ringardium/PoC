@@ -18,5 +18,5 @@ gmc_method: sparseOptFlow # method of global motion compensation
 # ReID model related thresh
 proximity_thresh: 0.3 # minimum IoU for valid match with ReID (↓ allows ReID to recover distant re-appearances)
 appearance_thresh: 0.65 # minimum appearance similarity for ReID (↓ easier ReID match, tune up if pets look similar)
-with_reid: True # ← enabled: appearance-based re-matching dramatically reduces ID switches
+with_reid: False # ← enabled: appearance-based re-matching dramatically reduces ID switches
 model: auto # uses native features if detector is YOLO else yolo11n-cls.pt

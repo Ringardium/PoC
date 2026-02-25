@@ -22,8 +22,8 @@ class StreamConfig:
     task_active: bool = False
     threshold: float = 0.3
     fight_speed_threshold: float = 5.0
-    inert_threshold: float = 1.5   # avg speed (px/frame) — below this = inert
-    inert_frames: int = 100
+    inert_threshold: float = 1.0   # avg speed (px/frame) — below this = inert
+    inert_frames: int = 150
     sleep_threshold: float = 30.0
     sleep_frames: int = 200
     sleep_aspect_ratio: float = 1.2
