@@ -373,6 +373,7 @@ class MultiStreamProcessor:
                 similarity_threshold=sc.reid_threshold,
                 correction_enabled=True,
                 global_id_enabled=sc.reid_global_id,
+                freeze_registered=sc.reid_freeze_registered,
             )
             state.reid_tracker = ReIDTracker(
                 reid_method=sc.reid_method,

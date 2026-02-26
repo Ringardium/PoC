@@ -343,6 +343,7 @@ class GlobalIDManagerConfig:
         'behavior': 0.3
     })
     enable_events: bool = False
+    freeze_registered: bool = True  # True: 등록 프로필 특징 고정 (드리프트 방지), False: EMA 업데이트 허용
 
 
 # === 메인 클래스 ===
@@ -786,17 +787,27 @@ class GlobalIDManager:
 
     def _update_gallery(self, global_id: int, features: Dict[str, np.ndarray],
                         channel_id: str, box: tuple = None):
-        """갤러리 업데이트"""
+        """갤러리 업데이트
+
+        등록 프로필(is_registered)은 특징을 업데이트하지 않고 bbox만 갱신.
+        anchor + representative가 원본 ref 그대로 유지되어 드리프트 없음.
+        """
         if global_id not in self.galleries:
             return
 
         gallery = self.galleries[global_id]
 
-        for feat_type, feature in features.items():
-            if feature is not None and len(feature) > 0:
-                weight = self.config.feature_weights.get(feat_type, 1.0)
-                gallery.update(feat_type, feature, channel_id,
-                              alpha=self.config.ema_alpha, weight=weight)
+        if gallery.is_registered and self.config.freeze_registered:
+            # 등록 프로필 고정 모드: last_seen, channels_seen만 갱신
+            gallery.last_seen = time.time()
+            gallery.channels_seen.add(channel_id)
+        else:
+            # 비등록 객체 또는 freeze_registered=False: 특징 업데이트 (EMA + deque)
+            for feat_type, feature in features.items():
+                if feature is not None and len(feature) > 0:
+                    weight = self.config.feature_weights.get(feat_type, 1.0)
+                    gallery.update(feat_type, feature, channel_id,
+                                  alpha=self.config.ema_alpha, weight=weight)
 
         if box is not None:
             gallery.last_bbox = tuple(box[:4])

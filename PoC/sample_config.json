@@ -55,6 +55,7 @@
       "reid_method": "adaptive",
       "reid_threshold": 0.5,
       "reid_global_id": false,
+      "reid_freeze_registered": true,
       "label_registered_only": false,
       "yolo_conf": 0.7,
       "yolo_iou": 0.5,

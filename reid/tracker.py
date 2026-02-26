@@ -88,6 +88,7 @@ class ReIDTrackerConfig:
 
     # 글로벌 ID
     global_id_enabled: bool = False
+    freeze_registered: bool = True  # 등록 프로필 특징 고정 (드리프트 방지)
 
     # 이벤트
     enable_events: bool = True
@@ -225,9 +226,15 @@ class ReIDTracker:
         # 글로벌 ID 매니저
         self.global_id_manager = None
         if self.config.global_id_enabled:
+            from reid.global_id import GlobalIDManagerConfig
+            gid_config = GlobalIDManagerConfig(
+                similarity_threshold=self.config.similarity_threshold,
+                ema_alpha=self.config.gallery_ema_alpha,
+                freeze_registered=self.config.freeze_registered,
+            )
             self.global_id_manager = GlobalIDManager(
                 feature_dim=self.feature_dim,
-                similarity_threshold=self.config.similarity_threshold
+                config=gid_config,
             )
 
         # 보정 쿨다운: track_id -> 남은 쿨다운 프레임 수

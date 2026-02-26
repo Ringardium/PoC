@@ -48,6 +48,7 @@ class StreamConfig:
     reid_method: str = "adaptive"       # adaptive, histogram, mobilenet
     reid_threshold: float = 0.5
     reid_global_id: bool = False
+    reid_freeze_registered: bool = True  # True: 등록 프로필 특징 고정 (드리프트 방지)
     # YOLO inference settings
     yolo_conf: float = 0.7              # confidence threshold
     yolo_iou: float = 0.5               # IoU threshold for NMS
