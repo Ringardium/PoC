@@ -1,0 +1,45 @@
+# ReID Metric Learning Default Configuration
+# Usage: python -m models.train reid --config models/train/configs/reid_default.yaml --data-root data/reid
+
+# Data
+data_root: ""           # {identity}/{img.jpg, ...} 구조
+query_ratio: 0.2        # 평가용 query/gallery 분할
+
+# Model
+backbone: dinov2_vits14  # dinov2_vits14 | mobilenet_v3_small
+embed_dim: 256
+freeze_backbone: false
+pretrained: true
+
+# Training
+epochs: 60
+p: 8                     # PK sampler: P identities per batch
+k: 4                     # PK sampler: K images per identity
+lr: 0.0001
+weight_decay: 0.0001
+warmup_epochs: 5
+scheduler: cosine        # cosine | step
+step_size: 20
+step_gamma: 0.5
+device: auto
+workers: 4
+imgsz: 224
+
+# Loss
+loss: combined           # triplet | arcface | combined
+triplet_margin: 0.3
+arcface_scale: 30.0
+arcface_margin: 0.5
+triplet_weight: 1.0
+arcface_weight: 0.5
+
+# Augmentation
+random_crop: true
+color_jitter: 0.3
+random_erasing: 0.5
+horizontal_flip: 0.5
+
+# Save
+project: runs/reid
+name: pet_reid
+save_interval: 5

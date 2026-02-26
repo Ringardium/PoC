@@ -74,6 +74,8 @@ class MultiFeatureGallery:
     channels_seen: set = field(default_factory=set)
     last_bbox: Optional[tuple] = None  # (x_center, y_center, w, h)
     is_registered: bool = False  # True for pet profile galleries — never expire
+    # 등록 프로필 원본 특징 (드리프트 방지용 anchor)
+    _anchor_features: Dict[str, np.ndarray] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # Size profile — accumulated bbox geometry for size-based matching
@@ -89,7 +91,11 @@ class MultiFeatureGallery:
 
     def update(self, feature_type: str, feature: np.ndarray,
                channel_id: str, alpha: float = 0.3, weight: float = 1.0):
-        """특정 타입의 특징 업데이트"""
+        """특정 타입의 특징 업데이트
+
+        등록된 프로필(is_registered=True)은 representative를 고정하고
+        deque에만 런타임 특징을 추가하여 EMA 드리프트를 방지.
+        """
         if feature is None or len(feature) == 0:
             return
 
@@ -99,7 +105,14 @@ class MultiFeatureGallery:
         self.total_appearances += 1
         self.channels_seen.add(channel_id)
 
-        # EMA 대표 특징 업데이트
+        # 등록된 프로필: representative 고정 (EMA 드리프트 방지)
+        if self.is_registered:
+            if feature_type not in self.representatives:
+                self.representatives[feature_type] = feature.copy()
+            # else: representative를 업데이트하지 않음 — 원본 ref 유지
+            return
+
+        # 비등록 객체: EMA 대표 특징 업데이트
         if feature_type not in self.representatives:
             self.representatives[feature_type] = feature.copy()
         else:
@@ -205,20 +218,34 @@ class WeightedMultiFeatureMatching(GalleryMatchingStrategy):
     def _gallery_similarity(self, query_feat: np.ndarray,
                             gallery: MultiFeatureGallery,
                             feat_type: str) -> float:
-        """query와 갤러리 저장 특징 전부 비교, 최고 유사도 반환."""
-        stored = gallery.features.get(feat_type)
-        if not stored:
-            # fallback to representative
-            rep = gallery.representatives.get(feat_type)
-            if rep is not None:
-                return float(np.dot(query_feat, rep))
-            return 0.0
+        """query와 갤러리 저장 특징 전부 비교, 최고 유사도 반환.
 
+        등록 프로필의 anchor 특징도 비교 대상에 포함하여
+        deque에서 원본이 밀려나도 안정적으로 매칭.
+        """
         best = 0.0
-        for feat in stored:
-            sim = float(np.dot(query_feat, feat))
+
+        # anchor 특징 (등록 프로필 원본 — 드리프트 없음)
+        anchor = gallery._anchor_features.get(feat_type)
+        if anchor is not None:
+            sim = float(np.dot(query_feat, anchor))
             if sim > best:
                 best = sim
+
+        # deque 저장 특징 (런타임 CCTV crop)
+        stored = gallery.features.get(feat_type)
+        if stored:
+            for feat in stored:
+                sim = float(np.dot(query_feat, feat))
+                if sim > best:
+                    best = sim
+
+        # fallback to representative
+        if best == 0.0:
+            rep = gallery.representatives.get(feat_type)
+            if rep is not None:
+                best = float(np.dot(query_feat, rep))
+
         return best
 
     def match(self, query_features: Dict[str, np.ndarray],
@@ -468,6 +495,8 @@ class GlobalIDManager:
                 # 갤러리에 등록 — is_registered=True로 만료 방지
                 gallery = MultiFeatureGallery(global_id=gid, is_registered=True)
                 gallery.update('appearance', rep_feature, '__registered__')
+                # 원본 ref 특징을 anchor로 고정 (EMA 드리프트 방지)
+                gallery._anchor_features['appearance'] = rep_feature.copy()
                 self.galleries[gid] = gallery
                 registered += 1
                 self.logger.info(f"펫 프로필 등록: {profile.name} -> G:{gid}")
@@ -546,7 +575,8 @@ class GlobalIDManager:
 
     def get_global_id_multi(self, channel_id: str, local_id: int,
                             features: Dict[str, np.ndarray],
-                            box: tuple = None) -> int:
+                            box: tuple = None,
+                            exclude_gids: set = None) -> int:
         """
         다중 특징으로 글로벌 ID 획득
 
@@ -555,11 +585,12 @@ class GlobalIDManager:
             local_id: 로컬 트랙 ID
             features: 특징 타입 -> 특징 벡터 딕셔너리
             box: 바운딩 박스 (선택)
+            exclude_gids: 이번 프레임에서 이미 할당된 global_id (중복 방지)
 
         Returns:
             global_id
         """
-        return self._get_global_id_internal(channel_id, local_id, features, box)
+        return self._get_global_id_internal(channel_id, local_id, features, box, exclude_gids)
 
     def _get_global_id_internal(self, channel_id: str, local_id: int,
                                  features: Dict[str, np.ndarray],

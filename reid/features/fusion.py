@@ -363,6 +363,27 @@ class FeatureFusionEngine:
 
         return results
 
+    def extract_static(self, image: np.ndarray,
+                       context: TrackContext = None) -> Dict[str, FeatureOutput]:
+        """정지 이미지(reference)용 특징 추출 — requires_history=False인 extractor만 사용.
+
+        Returns:
+            {feature_type: FeatureOutput} — type별 개별 결과 (융합하지 않음)
+        """
+        results = {}
+        for name, extractor in self.enabled_extractors.items():
+            if extractor.requires_history:
+                continue
+            try:
+                output = extractor.extract(image, context)
+                if output.is_valid:
+                    if self.config.normalize_output:
+                        output.feature = FeatureExtractor.normalize(output.feature)
+                    results[name] = output
+            except Exception as e:
+                self.logger.warning(f"Static extraction failed for {name}: {e}")
+        return results
+
     def reset_state(self, track_ids: set = None):
         """모든 추출기 상태 초기화"""
         for extractor in self.extractors.values():

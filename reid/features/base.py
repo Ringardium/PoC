@@ -88,6 +88,12 @@ class FeatureExtractor(ABC):
         """Fusion 가중치"""
         return self.config.weight
 
+    @property
+    def requires_history(self) -> bool:
+        """True이면 시계열 데이터 필요 (motion, trajectory 등).
+        정지 이미지(reference 사진)에서는 이 extractor를 건너뜀."""
+        return False
+
     @abstractmethod
     def extract(self, image: np.ndarray, context: TrackContext = None) -> FeatureOutput:
         """

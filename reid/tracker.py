@@ -241,8 +241,9 @@ class ReIDTracker:
         self._processing_times = deque(maxlen=100)
         self._frame_idx = 0
 
-        self.logger.info(f"ReIDTracker 초기화 - method: {reid_method}, "
-                        f"correction: {correction_enabled}, global_id: {global_id_enabled}")
+        self.logger.info(f"ReIDTracker 초기화 - method: {self._reid_method}, "
+                        f"correction: {self.config.correction_enabled}, "
+                        f"global_id: {self.config.global_id_enabled}")
 
     def _setup_extractors(self):
         """특징 추출기 설정"""
@@ -338,7 +339,9 @@ class ReIDTracker:
     def register_pet_profiles(self, profile_dir: str):
         """Pet profile 레퍼런스 이미지를 자체 특징 추출기로 추출하여 GlobalIDManager에 등록.
 
-        이렇게 하면 런타임 특징과 동일한 차원의 벡터로 갤러리가 구성됩니다.
+        Fusion engine 사용 시 requires_history=False인 extractor만 사용하여
+        feature type별로 개별 등록. 정지 이미지에서 motion/trajectory 등
+        시계열 feature가 0으로 채워지는 문제를 방지.
         """
         if not self.global_id_manager:
             return
@@ -360,7 +363,8 @@ class ReIDTracker:
 
             for profile in profiles:
                 gid = profile.global_id
-                features_list = []
+                # type별 feature 누적: {feat_type: [feat1, feat2, ...]}
+                type_features = {}
 
                 for img_rel in profile.reference_images:
                     img_path = base / img_rel
@@ -370,38 +374,44 @@ class ReIDTracker:
                     if img is None:
                         continue
 
-                    # Use the same extraction pipeline as runtime
-                    crops = [img]
                     if self.fusion_engine:
                         from reid.features.base import TrackContext
                         ctx = TrackContext(track_id=gid, bbox=(0, 0, img.shape[1], img.shape[0]))
-                        outputs = self.fusion_engine.extract_batch(crops, [ctx])
-                        if outputs and outputs[0].feature is not None:
-                            feat = outputs[0].feature
-                            norm = np.linalg.norm(feat)
-                            if norm > 1e-8:
-                                feat = feat / norm
-                            features_list.append(feat)
+                        # extract_static: requires_history=False만, type별 개별 반환
+                        static_outputs = self.fusion_engine.extract_static(img, ctx)
+                        for feat_type, output in static_outputs.items():
+                            if output.is_valid:
+                                feat = output.feature
+                                norm = np.linalg.norm(feat)
+                                if norm > 1e-8:
+                                    feat = feat / norm
+                                type_features.setdefault(feat_type, []).append(feat)
                     elif self._legacy_extractor:
-                        feats = self._legacy_extractor.extract_features_batch(crops, [gid])
+                        feats = self._legacy_extractor.extract_features_batch([img], [gid])
                         if feats is not None and len(feats) > 0 and feats[0] is not None and len(feats[0]) > 0:
                             feat = feats[0]
                             norm = np.linalg.norm(feat)
                             if norm > 1e-8:
                                 feat = feat / norm
-                            features_list.append(feat)
+                            type_features.setdefault('appearance', []).append(feat)
 
-                if not features_list:
+                if not type_features:
                     continue
 
-                rep_feature = np.mean(features_list, axis=0).astype(np.float32)
-                rep_feature = rep_feature / (np.linalg.norm(rep_feature) + 1e-8)
-
+                # type별 대표 특징 계산 후 갤러리에 등록
                 gallery = MultiFeatureGallery(global_id=gid, is_registered=True)
-                gallery.update('appearance', rep_feature, '__registered__')
+                dims = []
+                for feat_type, feat_list in type_features.items():
+                    rep = np.mean(feat_list, axis=0).astype(np.float32)
+                    rep = rep / (np.linalg.norm(rep) + 1e-8)
+                    gallery.update(feat_type, rep, '__registered__')
+                    # 원본 ref 특징을 anchor로 고정 (EMA 드리프트 방지)
+                    gallery._anchor_features[feat_type] = rep.copy()
+                    dims.append(f"{feat_type}={len(rep)}")
+
                 self.global_id_manager.galleries[gid] = gallery
                 registered += 1
-                self.logger.info(f"펫 프로필 등록: {profile.name} -> G:{gid} (dim={len(rep_feature)})")
+                self.logger.info(f"펫 프로필 등록: {profile.name} -> G:{gid} ({', '.join(dims)})")
 
             if self.global_id_manager.galleries:
                 max_gid = max(self.global_id_manager.galleries.keys())
@@ -409,7 +419,7 @@ class ReIDTracker:
                     self.global_id_manager._next_global_id, max_gid + 1
                 )
 
-            self.logger.info(f"펫 프로필 {registered}개 등록 완료 (feature_dim={self.feature_dim})")
+            self.logger.info(f"펫 프로필 {registered}개 등록 완료")
 
         except Exception as e:
             self.logger.warning(f"펫 프로필 등록 실패: {e}", exc_info=True)
@@ -458,11 +468,22 @@ class ReIDTracker:
         # 1. 크롭 및 특징 추출
         crops = self._extract_crops(frame, boxes)
 
+        # Global ID용 static feature (appearance만, type별 분리)
+        self._last_static_features = None
+
         if self.fusion_engine:
             contexts = self._create_contexts(boxes, track_ids)
             feature_outputs = self.fusion_engine.extract_batch(crops, contexts)
             features = [out.feature for out in feature_outputs]
             confidences = [out.confidence for out in feature_outputs]
+            # Global ID 매칭용: requires_history=False인 feature만 추출
+            if self.config.global_id_enabled and self.global_id_manager:
+                static_features_list = []
+                for crop, ctx in zip(crops, contexts):
+                    static_features_list.append(
+                        self.fusion_engine.extract_static(crop, ctx)
+                    )
+                self._last_static_features = static_features_list
         else:
             features = self._legacy_extractor.extract_features_batch(crops, track_ids)
             confidences = [1.0] * len(features)
@@ -515,7 +536,7 @@ class ReIDTracker:
         if self.config.global_id_enabled and self.global_id_manager:
             global_ids = []
             used_gids = set()  # Prevent same global_id assigned to multiple objects in one frame
-            for track_id, feature, box in zip(corrected_ids, features, boxes):
+            for i, (track_id, feature, box) in enumerate(zip(corrected_ids, features, boxes)):
                 if track_id in _prox:
                     # Proximity locked — skip feature update, keep existing mapping
                     key = (channel_id, track_id)
@@ -524,10 +545,21 @@ class ReIDTracker:
                         global_ids.append(existing)
                         used_gids.add(existing)
                         continue
-                gid = self.global_id_manager.get_global_id(
-                    channel_id, track_id, feature, box,
-                    exclude_gids=used_gids,
-                )
+                # Static features (appearance만) 사용 — 프로필과 동일 차원
+                if self._last_static_features and i < len(self._last_static_features):
+                    static_feats = self._last_static_features[i]
+                    # type별 features dict 구성
+                    feat_dict = {ft: out.feature for ft, out in static_feats.items()
+                                 if out.is_valid}
+                    gid = self.global_id_manager.get_global_id_multi(
+                        channel_id, track_id, feat_dict, box,
+                        exclude_gids=used_gids,
+                    )
+                else:
+                    gid = self.global_id_manager.get_global_id(
+                        channel_id, track_id, feature, box,
+                        exclude_gids=used_gids,
+                    )
                 global_ids.append(gid)
                 used_gids.add(gid)
             result['global_ids'] = global_ids

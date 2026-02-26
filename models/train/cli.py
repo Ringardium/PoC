@@ -15,6 +15,7 @@ from .config import (
     FinetuneConfig,
     LossConfig,
     MergeConfig,
+    ReIDConfig,
     load_config,
 )
 
@@ -421,6 +422,98 @@ def sample(data, output, strategy, max_per_class, min_per_class, seed, no_copy_v
         seed=seed,
         copy_val=not no_copy_val,
     )
+
+
+# ── Mode 9: ReID Metric Learning ──────────────────────────────────
+
+
+@cli.command()
+@click.option("--data-root", required=True, help="Root folder with identity subfolders ({id}/{img.jpg})")
+@click.option("--backbone", default="dinov2_vits14", type=click.Choice(["dinov2_vits14", "mobilenet_v3_small"]),
+              help="Backbone model (default: dinov2_vits14)")
+@click.option("--embed-dim", default=256, help="Output embedding dimension")
+@click.option("--freeze-backbone", is_flag=True, help="Freeze backbone weights (train head only)")
+@click.option("--epochs", default=60, help="Training epochs")
+@click.option("--p", default=8, help="PK sampler: identities per batch")
+@click.option("--k", default=4, help="PK sampler: images per identity")
+@click.option("--lr", default=1e-4, type=float, help="Learning rate")
+@click.option("--loss", "loss_type", default="combined", type=click.Choice(["triplet", "arcface", "combined"]),
+              help="Loss function (default: combined)")
+@click.option("--triplet-margin", default=0.3, help="Triplet loss margin")
+@click.option("--arcface-scale", default=30.0, help="ArcFace scale")
+@click.option("--arcface-margin", default=0.5, help="ArcFace angular margin")
+@click.option("--imgsz", default=224, help="Input image size")
+@click.option("--device", default=None, help="Device (auto-detect if not set)")
+@click.option("--workers", default=4, help="Data loading workers")
+@click.option("--project", default="runs/reid", help="Project save directory")
+@click.option("--name", default="pet_reid", help="Experiment name")
+@click.option("--config", "config_path", default=None, help="Path to YAML config file")
+@click.option("--query-ratio", default=0.2, help="Query split ratio for evaluation")
+@click.option("--save-interval", default=5, help="Evaluate & save every N epochs")
+@click.option("--scheduler", default="cosine", type=click.Choice(["cosine", "step"]),
+              help="LR scheduler")
+@click.option("--warmup-epochs", default=5, help="Warmup epochs")
+def reid(config_path, **params):
+    """Train pet ReID model with metric learning (TripletLoss + ArcFace).
+
+    \b
+    Dataset structure:
+      data_root/
+        identity_A/
+          img_001.jpg, img_002.jpg, ...
+        identity_B/
+          img_001.jpg, ...
+
+    Mix of reference photos and CCTV crops recommended (ratio ~2:8).
+
+    \b
+    Examples:
+      python -m models.train reid --data-root data/reid --backbone dinov2_vits14
+      python -m models.train reid --data-root data/reid --backbone mobilenet_v3_small --freeze-backbone
+      python -m models.train reid --data-root data/reid --loss triplet --epochs 100
+      python -m models.train reid --config configs/reid_default.yaml --data-root data/reid
+    """
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+    from .reid_train import run_reid
+
+    if config_path:
+        config = load_config(config_path, ReIDConfig)
+    else:
+        config = ReIDConfig()
+
+    # Apply CLI overrides
+    direct_map = {
+        "data_root": "data_root",
+        "backbone": "backbone",
+        "embed_dim": "embed_dim",
+        "freeze_backbone": "freeze_backbone",
+        "epochs": "epochs",
+        "p": "p",
+        "k": "k",
+        "lr": "lr",
+        "loss_type": "loss",
+        "triplet_margin": "triplet_margin",
+        "arcface_scale": "arcface_scale",
+        "arcface_margin": "arcface_margin",
+        "imgsz": "imgsz",
+        "device": "device",
+        "workers": "workers",
+        "project": "project",
+        "name": "name",
+        "query_ratio": "query_ratio",
+        "save_interval": "save_interval",
+        "scheduler": "scheduler",
+        "warmup_epochs": "warmup_epochs",
+    }
+
+    for cli_key, cfg_attr in direct_map.items():
+        val = params.get(cli_key)
+        if val is not None:
+            setattr(config, cfg_attr, val)
+
+    run_reid(config)
 
 
 if __name__ == "__main__":

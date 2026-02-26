@@ -66,6 +66,10 @@ class MotionFeatureExtractor(FeatureExtractor):
     def feature_type(self) -> str:
         return "motion"
 
+    @property
+    def requires_history(self) -> bool:
+        return True
+
     def _get_center_and_size(self, bbox: Tuple) -> Tuple[float, float, float, float]:
         """바운딩 박스에서 중심점과 크기 추출"""
         if len(bbox) == 4:
@@ -488,6 +492,10 @@ class TrajectoryFeatureExtractor(FeatureExtractor):
     @property
     def feature_type(self) -> str:
         return "motion"
+
+    @property
+    def requires_history(self) -> bool:
+        return True
 
     def extract(self, image: np.ndarray, context: TrackContext = None) -> FeatureOutput:
         if context is None or context.bbox is None:

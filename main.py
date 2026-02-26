@@ -819,23 +819,8 @@ def main(
                 if len(escaped_ids):
                     state_texts.append(CONFIG_ESCAPE_TEXT)
 
-            # detect inert
-            if task_inert:
-                inert_indices = detect_inert(
-                    inert_coor,
-                    inert_threshold,
-                    inert_frames,
-                )
-
-                # 무기력 감지된 ID 상태 업데이트
-                for id in inert_indices:
-                    if id in id_to_index.keys():
-                        id_states[id] = "inert"
-
-                if len(inert_indices) > 0:
-                    state_texts.append(CONFIG_INERT_TEXT)
-
-            # detect sleep
+            # detect sleep (inert보다 먼저 — sleep이 우선)
+            sleep_indices = []
             if task_sleep:
                 sleep_indices = detect_sleep(
                     sleep_coor,
@@ -853,6 +838,23 @@ def main(
 
                 if len(sleep_indices) > 0:
                     state_texts.append(CONFIG_SLEEP_TEXT)
+
+            # detect inert (sleep 감지된 ID 제외)
+            if task_inert:
+                inert_indices = detect_inert(
+                    inert_coor,
+                    inert_threshold,
+                    inert_frames,
+                )
+
+                sleep_set = set(sleep_indices)
+                # 무기력 감지된 ID 상태 업데이트 (sleep이 아닌 경우만)
+                for id in inert_indices:
+                    if id in id_to_index.keys() and id not in sleep_set:
+                        id_states[id] = "inert"
+
+                if len(inert_indices) > 0 and len(set(inert_indices) - sleep_set) > 0:
+                    state_texts.append(CONFIG_INERT_TEXT)
 
             # detect eat
             if task_eat:

@@ -1,0 +1,35 @@
+{
+    "names": {
+        "1": "뽀삐",
+        "3": "초코",
+        "5": "루루"
+    },
+    "events": [
+        {"id": 1, "behavior": "fight",  "start": "00:10", "end": "00:25"},
+        {"id": 1, "behavior": "eat",    "start": "01:30", "end": "02:00"},
+        {"id": 3, "behavior": "sleep",  "start": "00:30", "end": "03:00"},
+        {"id": 5, "behavior": "active", "start": "00:00", "end": "01:00"}
+    ],
+    "behavior_colors": {
+        "fight":    [255, 0, 0],
+        "sleep":    [0, 0, 255],
+        "eat":      [0, 200, 100],
+        "active":   [255, 165, 0],
+        "inert":    [128, 128, 128],
+        "bathroom": [160, 82, 45],
+        "escape":   [255, 0, 255]
+    },
+    "model": "weights/modelv11x.pt",
+    "tracker": "botsort",
+    "conf": 0.25,
+    "iou": 0.5,
+    "classes": [1],
+    "imgsz": 640,
+    "show_unnamed": true,
+    "default_color": [0, 255, 0],
+    "font_scale": 0.7,
+    "thickness": 2,
+    "use_reid": false,
+    "reid_method": "adaptive",
+    "reid_threshold": 0.5
+}

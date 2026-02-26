@@ -1485,17 +1485,17 @@ class MultiStreamProcessor:
                 if bid not in dog_behavior:
                     dog_behavior[bid] = "playing"
 
-        # Inert detection
+        # Inert detection (sleep 감지된 ID 제외)
         inert_set = set()
         if sc.task_inert:
             inert_ids = detect_inert(state.inert_coor, sc.inert_threshold, sc.inert_frames)
-            inert_set = set(inert_ids)
+            inert_set = set(inert_ids) - sleep_set  # sleep이 우선
             if len(inert_set) > 0:
                 for bid in (inert_set - state.prev_inert_ids):
                     _send_event({"dogId": _resolve_dog_id(bid), "behaviorType": BEHAVIOR_TYPE_MAP["inert"]})
                 stats = self._stats.get_stream_stats(sc.stream_id)
                 if stats:
-                    stats.detections["inert"] += len(inert_ids)
+                    stats.detections["inert"] += len(inert_set)
             state.prev_inert_ids = inert_set
             for bid in inert_set:
                 if bid not in dog_behavior:

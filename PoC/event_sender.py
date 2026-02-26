@@ -143,30 +143,80 @@ class EventSender:
 
 def send_event_cli():
     import argparse
+    import json
 
-    parser = argparse.ArgumentParser(description="Send behavior event to API")
-    parser.add_argument("--url", required=True, help="API endpoint URL")
-    parser.add_argument("--dog-id", required=True, help="Dog ID (name or number)")
-    parser.add_argument(
+    parser = argparse.ArgumentParser(description="Send behavior event(s) to API")
+    sub = parser.add_subparsers(dest="command")
+
+    # --- single event ---
+    p_single = sub.add_parser("send", help="Send a single event")
+    p_single.add_argument("--url", required=True, help="API endpoint URL")
+    p_single.add_argument("--dog-id", required=True, help="Dog ID (name or number)")
+    p_single.add_argument(
         "--behavior", required=True,
         choices=list(BEHAVIOR_TYPE_MAP.values()),
         help="Behavior type",
     )
-    parser.add_argument("--duration", type=float, default=None, help="Duration in seconds (for sleeping/playing)")
+    p_single.add_argument("--duration", type=float, default=None, help="Duration in seconds")
+    p_single.add_argument("--clip-url", default=None, help="Clip video URL (e.g. CDN or S3 presigned)")
+
+    # --- batch from JSON ---
+    p_batch = sub.add_parser("batch", help="Send events from a JSON file")
+    p_batch.add_argument("--url", required=True, help="API endpoint URL")
+    p_batch.add_argument("--file", required=True, help="JSON file with events list")
+
     args = parser.parse_args()
 
-    KST = timezone(timedelta(hours=9))
-    now_kst = datetime.now(KST)
-    event = {
-        "dogId": args.dog_id,
-        "behaviorType": args.behavior,
-        "detectedAt": now_kst.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    if args.duration is not None:
-        event["durationSeconds"] = args.duration
+    if args.command == "send" or args.command is None:
+        # Backward compat: if no subcommand, treat as single send
+        if args.command is None:
+            # Re-parse with old-style args
+            parser2 = argparse.ArgumentParser()
+            parser2.add_argument("--url", required=True)
+            parser2.add_argument("--dog-id", required=True)
+            parser2.add_argument("--behavior", required=True, choices=list(BEHAVIOR_TYPE_MAP.values()))
+            parser2.add_argument("--duration", type=float, default=None)
+            parser2.add_argument("--clip-url", default=None)
+            args = parser2.parse_args()
 
-    resp = requests.post(args.url, json=event, timeout=5.0)
-    print(f"[{resp.status_code}] {resp.text}")
+        KST = timezone(timedelta(hours=9))
+        now_kst = datetime.now(KST)
+        event = {
+            "dogId": args.dog_id,
+            "behaviorType": args.behavior,
+            "detectedAt": now_kst.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        if args.duration is not None:
+            event["durationSeconds"] = args.duration
+        if args.clip_url is not None:
+            event["clipUrl"] = args.clip_url
+
+        resp = requests.post(args.url, json=event, timeout=5.0)
+        print(f"[{resp.status_code}] {resp.text}")
+
+    elif args.command == "batch":
+        with open(args.file, encoding="utf-8") as f:
+            data = json.load(f)
+
+        events = data if isinstance(data, list) else data.get("events", [])
+        print(f"Sending {len(events)} events to {args.url}")
+
+        ok, fail = 0, 0
+        for i, event in enumerate(events):
+            try:
+                resp = requests.post(args.url, json=event, timeout=5.0)
+                status = resp.status_code
+                if status < 400:
+                    ok += 1
+                    print(f"  [{i+1}/{len(events)}] OK ({status})")
+                else:
+                    fail += 1
+                    print(f"  [{i+1}/{len(events)}] FAIL ({status}) {resp.text[:100]}")
+            except requests.RequestException as e:
+                fail += 1
+                print(f"  [{i+1}/{len(events)}] ERROR: {e}")
+
+        print(f"\nDone: {ok} sent, {fail} failed")
 
 
 if __name__ == "__main__":
