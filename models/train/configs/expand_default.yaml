@@ -1,0 +1,44 @@
+# Class expansion configuration
+# Usage: python -m train expand --config train/configs/expand_default.yaml \
+#            --old-model weights/modelv11x.pt --combined-data expanded_data.yaml
+
+epochs: 80
+imgsz: 640
+batch: 16
+device: auto
+workers: 8
+patience: 50
+optimizer: auto
+iou: 0.7              # NMS IoU threshold (validation)
+conf: 0.001           # Confidence threshold (validation)
+
+# Lower LR to preserve old class knowledge
+lr0: 0.001
+lrf: 0.01
+warmup_epochs: 3.0
+
+# Freeze backbone to prevent catastrophic forgetting
+freeze_layers: 10
+
+# Loss weights
+loss:
+  box: 7.5
+  cls: 1.25
+  dfl: 1.5
+
+# Lighter augmentation for stable expansion training
+augment:
+  mosaic: 1.0
+  copy_paste: 0.1
+  mixup: 0.0
+  erasing: 0.3
+  scale: 0.5
+  degrees: 5.0
+  translate: 0.1
+  perspective: 0.0
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  fliplr: 0.5
+  flipud: 0.0
+  close_mosaic: 10

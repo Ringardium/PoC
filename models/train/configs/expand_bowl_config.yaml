@@ -1,0 +1,65 @@
+# ──────────────────────────────────────────────────────────────
+# Bowl Class Expansion Config
+# ──────────────────────────────────────────────────────────────
+# 기존 모델(person, dog, cat)에 bowl(class 3) 추가 학습
+#
+# 사용법:
+#   python -m train expand \
+#       --config train/configs/expand_bowl_config.yaml \
+#       --old-model weights/modelv11x.pt \
+#       --combined-data dataset/bowl/data.yaml
+# ──────────────────────────────────────────────────────────────
+
+# 학습 기본 설정
+epochs: 60              # bowl은 단일 클래스 추가이므로 60 epoch 충분
+imgsz: 640
+batch: 16
+device: auto            # auto-detect: CUDA > MPS(Apple) > CPU
+workers: 8
+patience: 20            # bowl 학습은 빠르게 수렴 -> patience 낮게
+optimizer: SGD           # SGD + momentum이 expand에서 안정적
+iou: 0.7               # NMS IoU threshold (validation)
+conf: 0.001            # Confidence threshold (validation)
+
+# Learning Rate
+# 기존 클래스(person, dog, cat) 지식 보존 위해 낮은 LR
+lr0: 0.001
+lrf: 0.1               # cosine decay → 최종 LR = 0.001 * 0.1 = 0.0001
+warmup_epochs: 5.0      # 넉넉한 warmup으로 헤드 안정화
+
+# Backbone Freeze
+# backbone 앞 10개 레이어 동결 → 기존 feature 보존
+# neck/head만 학습하여 bowl 패턴 습득
+freeze_layers: 10
+
+# ──────────────────────────────────────────────────────────────
+# Loss Weights
+# ──────────────────────────────────────────────────────────────
+# bowl은 작은 객체 + 형태 단순 → cls 비중 높여서 분류 정확도 집중
+loss:
+  box: 7.5              # box loss (기본값 유지)
+  cls: 1.75              # cls loss 높임 (기본 0.5) → 새 클래스 분류 강화
+  dfl: 1.5              # dfl loss (기본값 유지)
+
+# ──────────────────────────────────────────────────────────────
+# Augmentation
+# ──────────────────────────────────────────────────────────────
+# bowl 특성에 맞춘 augmentation:
+# - bowl은 바닥에 놓여있어서 flip/rotation 제한적
+# - 크기 변화 큼(가까이/멀리) → scale 중요
+# - 동물과 겹치는 경우 많음 → copy_paste/mosaic 활용
+augment:
+  mosaic: 1.0           # 4장 합성으로 다양한 배치 학습
+  copy_paste: 0.2       # 적당한 copy-paste (bowl+동물 겹침 시뮬레이션)
+  mixup: 0.0            # mixup OFF (클래스 경계 흐려짐 방지)
+  erasing: 0.2          # 부분 가림 (동물이 bowl 가리는 상황)
+  scale: 0.7            # 크기 변화 크게 (가까이/멀리 bowl)
+  degrees: 5.0          # 약한 회전만 (bowl은 바닥에 고정)
+  translate: 0.15       # 위치 이동
+  perspective: 0.0      # perspective OFF (bowl 형태 왜곡 방지)
+  hsv_h: 0.015          # 색상 변화 (다양한 bowl 색상)
+  hsv_s: 0.5            # 채도 약간 낮춤
+  hsv_v: 0.3            # 밝기 변화 약간 낮춤
+  fliplr: 0.5           # 좌우 반전 OK
+  flipud: 0.0           # 상하 반전 OFF (bowl이 뒤집히면 비현실적)
+  close_mosaic: 10      # 마지막 10 epoch는 mosaic OFF

@@ -74,6 +74,8 @@ def build_train_args(config) -> dict:
         "lr0": config.lr0,
         "lrf": config.lrf,
         "warmup_epochs": config.warmup_epochs,
+        "iou": config.iou,
+        "conf": config.conf,
         # Loss weights
         "cls": config.loss.cls,
         "box": config.loss.box,

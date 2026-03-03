@@ -62,6 +62,8 @@ class TrainConfig:
     patience: int = 50
     resume: bool = False
     optimizer: str = "auto"
+    iou: float = 0.7  # NMS IoU threshold for validation
+    conf: float = 0.001  # Confidence threshold for validation
     lr0: float = 0.01
     lrf: float = 0.01
     warmup_epochs: float = 3.0

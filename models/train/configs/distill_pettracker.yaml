@@ -1,0 +1,63 @@
+# Knowledge Distillation: YOLOv11x -> YOLO26s
+# 최적화 대상: 소수 클래스(3-4), 소형 객체, 고밀도(수십 마리), 겹침/가려짐 빈번
+#
+# Usage:
+#   python -m models.train.cli distill \
+#     --config models/train/configs/distill_pettracker.yaml \
+#     --teacher weights/yolo11x_best.pt \
+#     --student yolo11s.yaml \
+#     --data data.yaml
+
+# --- Training ---
+epochs: 200               # 소형→대형 증류는 수렴이 느림, 충분한 epoch 필요
+imgsz: 640                # GPU 여유 시 960 권장 (소형 객체 정밀도 ↑)
+batch: 16                 # imgsz=960이면 8로 줄일 것
+device: auto
+workers: 8
+patience: 40              # 증류 학습은 plateau 길어짐, 넉넉하게
+optimizer: AdamW          # 작은 모델 + 증류에 AdamW가 안정적
+resume: false
+
+# --- Learning Rate ---
+lr0: 0.002                # 증류는 teacher가 가이드하므로 낮은 LR
+lrf: 0.01                 # 최종 LR = lr0 * lrf = 0.00002
+warmup_epochs: 5.0        # adapter 파라미터 안정화를 위해 긴 warmup
+
+# --- Distillation ---
+temperature: 3.0          # 3-4 클래스에선 낮은 T가 더 sharp한 supervision 제공
+alpha: 0.4                # task 60% + distill 40%, 고밀도 장면은 GT supervision 중요
+distill_features: true    # backbone feature 증류 (핵심)
+feature_layers: []        # auto-detect (Detect head에 연결된 P3/P4/P5)
+
+# --- Validation ---
+iou: 0.75                 # 겹침 빈번 → 높은 NMS IoU로 인접 객체 보존
+conf: 0.001               # 낮은 conf로 recall 평가 정확도 확보
+
+# --- Loss Weights ---
+# 소형 객체 + 고밀도 장면에 맞춘 가중치
+loss:
+  box: 10.0               # ↑ 소형 객체 localization 정밀도 강화 (default 7.5)
+  cls: 1.25               # teacher와 동일 - 겹침/가려짐 상황에서 분류 정확도 유지
+  dfl: 2.0                # ↑ 소형 객체 bbox 분포 정밀도 강화 (default 1.5)
+
+# --- Augmentation ---
+# 고밀도 + 겹침/가려짐 시나리오에 최적화된 공격적 augmentation
+augment:
+  mosaic: 1.0             # 필수 - 소형 객체 instances 증가, 밀도 시뮬레이션
+  copy_paste: 0.5         # ↑ 객체 겹침/밀집 시나리오 생성 (default 0.3)
+  mixup: 0.1              # 가볍게 - 과하면 소형 객체 디테일 손실
+  erasing: 0.5            # ↑ 가려짐(occlusion) 시뮬레이션 (default 0.4)
+  scale: 0.9              # ↑ 다양한 스케일 학습 (소형 객체 스케일 불변성)
+  degrees: 10.0           # 동물 자세 변화 반영
+  translate: 0.2          # 위치 변화
+  perspective: 0.001      # 약간의 원근 변환 (카메라 각도 차이)
+  hsv_h: 0.02             # 색상 변화 (동물 개체별 모색 차이)
+  hsv_s: 0.7              # 채도 변화
+  hsv_v: 0.4              # 명도 변화 (실내/실외 조명)
+  fliplr: 0.5             # 좌우 반전
+  flipud: 0.0             # 상하 반전 불필요 (동물은 뒤집히지 않음)
+  close_mosaic: 20        # ↑ mosaic를 오래 유지 (소형 객체 학습 극대화, default 10)
+
+# --- Project ---
+project: runs/train
+name: distill_v11x_to_26s

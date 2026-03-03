@@ -1,0 +1,64 @@
+# ──────────────────────────────────────────────────────────────
+# Bowl Class Expansion Config (320x320 target)
+# ──────────────────────────────────────────────────────────────
+# 기존 모델(person, dog, cat)에 bowl(class 3) 추가 학습
+# 320 해상도 엣지 디바이스 타겟, 기존+추가 데이터 함께 사용
+#
+# 사용법:
+#   python -m train expand \
+#       --config train/configs/expand_bowl_320.yaml \
+#       --old-model weights/modelv11x.pt \
+#       --combined-data dataset/bowl_fix/data.yaml
+# ──────────────────────────────────────────────────────────────
+
+# 학습 기본 설정
+epochs: 100             # 320은 정보량 적음 → 충분한 epoch 필요
+imgsz: 320              # 320x320 타겟 해상도
+batch: 64               # 320 작은 이미지 → 배치 키워서 학습 안정화
+device: auto
+workers: 8
+patience: 30            # 기존+추가 데이터 혼합이라 수렴 느릴 수 있음
+optimizer: SGD
+iou: 0.7               # NMS IoU threshold (validation)
+conf: 0.001            # Confidence threshold (validation)
+
+# Learning Rate
+lr0: 0.005              # 기존 데이터 포함이라 0.001보다 약간 높게
+lrf: 0.1                # cosine decay → 최종 LR = 0.005 * 0.1 = 0.0005
+warmup_epochs: 5.0
+
+# Backbone Freeze
+# 320에서는 low-level feature도 재학습 필요 → freeze 줄임
+freeze_layers: 5
+
+# ──────────────────────────────────────────────────────────────
+# Loss Weights
+# ──────────────────────────────────────────────────────────────
+# 320 저해상도 → box 정밀도 중요, cls 비중도 유지
+loss:
+  box: 10.0             # box loss 높임 (320에서 bbox 정확도 보상)
+  cls: 1.0              # cls loss 높임 → 새 클래스 분류 강화
+  dfl: 2.0              # dfl 약간 높임 (저해상도 분포 학습 보강)
+
+# ──────────────────────────────────────────────────────────────
+# Augmentation
+# ──────────────────────────────────────────────────────────────
+# 320 저해상도 특성:
+# - 이미 작은 이미지 → 과도한 scale/erasing은 정보 손실
+# - mosaic으로 다양한 배치 구성은 유지
+# - copy_paste로 겹침 시뮬레이션
+augment:
+  mosaic: 1.0
+  copy_paste: 0.2
+  mixup: 0.0
+  erasing: 0.1          # 320에서 과도한 erasing은 정보 손실
+  scale: 0.5            # 320이라 scale 줄임 (너무 축소되면 감지 불가)
+  degrees: 5.0
+  translate: 0.15
+  perspective: 0.0
+  hsv_h: 0.015
+  hsv_s: 0.5
+  hsv_v: 0.3
+  fliplr: 0.5
+  flipud: 0.0
+  close_mosaic: 15      # 마지막 15 epoch mosaic OFF → 실제 추론 환경 적응

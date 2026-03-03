@@ -3,7 +3,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics.utils.loss import v8DetectionLoss
 
 
 class ResponseDistillationLoss(nn.Module):
@@ -31,12 +30,23 @@ class ResponseDistillationLoss(nn.Module):
         Returns:
             Scalar distillation loss.
         """
+        if not student_preds or not teacher_preds:
+            device = student_preds[0].device if student_preds else "cpu"
+            return torch.tensor(0.0, device=device)
+
         loss = torch.tensor(0.0, device=student_preds[0].device)
         n_levels = min(len(student_preds), len(teacher_preds))
 
         for i in range(n_levels):
             s_pred = student_preds[i]
             t_pred = teacher_preds[i]
+
+            # Validate tensor shape: must be [B, C, H, W] with enough channels
+            min_channels = self.reg_max * 4 + self.nc
+            if s_pred.dim() != 4 or s_pred.shape[1] < min_channels:
+                continue
+            if t_pred.dim() != 4 or t_pred.shape[1] < min_channels:
+                continue
 
             # Handle spatial size mismatch
             if s_pred.shape[2:] != t_pred.shape[2:]:
@@ -79,16 +89,11 @@ class FeatureDistillationLoss(nn.Module):
     def forward(
         self, student_features: dict[int, torch.Tensor], teacher_features: dict[int, torch.Tensor], layer_indices: list[int]
     ) -> torch.Tensor:
-        """Compute feature distillation loss.
+        """Compute feature distillation loss using channel-wise cosine similarity."""
+        if not student_features or not teacher_features:
+            device = self.adapters[0].weight.device if len(self.adapters) > 0 and hasattr(self.adapters[0], "weight") else "cpu"
+            return torch.tensor(0.0, device=device)
 
-        Args:
-            student_features: Dict of {layer_idx: feature_tensor} from student.
-            teacher_features: Dict of {layer_idx: feature_tensor} from teacher.
-            layer_indices: List of layer indices to distill.
-
-        Returns:
-            Scalar feature distillation loss.
-        """
         loss = torch.tensor(0.0, device=next(iter(student_features.values())).device)
         count = 0
 
@@ -107,10 +112,11 @@ class FeatureDistillationLoss(nn.Module):
             if s_feat.shape[2:] != t_feat.shape[2:]:
                 s_feat = F.adaptive_avg_pool2d(s_feat, t_feat.shape[2:])
 
-            # Normalize and compute L2
-            s_norm = F.normalize(s_feat.flatten(2), dim=-1)
-            t_norm = F.normalize(t_feat.flatten(2), dim=-1)
-            loss += F.mse_loss(s_norm, t_norm.detach())
+            # Channel-wise cosine similarity loss (dimension-invariant, range [0, 2])
+            s_flat = s_feat.flatten(2)  # [B, C, H*W]
+            t_flat = t_feat.flatten(2).detach()
+            cos_sim = F.cosine_similarity(s_flat, t_flat, dim=-1)  # [B, C]
+            loss += (1 - cos_sim).mean()
             count += 1
 
         return loss / max(count, 1)
@@ -119,12 +125,13 @@ class FeatureDistillationLoss(nn.Module):
 class DistillationLoss:
     """Combined detection + distillation loss.
 
-    Wraps v8DetectionLoss and adds response/feature distillation terms.
+    Wraps the original task loss and adds response/feature distillation terms.
     Designed to replace model.criterion for teacher-student training.
     """
 
     def __init__(
         self,
+        task_loss,
         student_model,
         teacher_model,
         temperature: float = 4.0,
@@ -134,20 +141,21 @@ class DistillationLoss:
         student_features: dict | None = None,
         teacher_features: dict | None = None,
     ):
-        self.task_loss = v8DetectionLoss(student_model)
+        self.task_loss = task_loss
         self.teacher = teacher_model
         self.alpha = alpha
         self.feature_loss_fn = feature_loss
         self.feature_layers = feature_layers or []
-        self.student_features = student_features or {}
-        self.teacher_features = teacher_features or {}
+        self.student_features = student_features if student_features is not None else {}
+        self.teacher_features = teacher_features if teacher_features is not None else {}
 
-        # Proxy attributes needed by the trainer
-        self.stride = self.task_loss.stride
-        self.nc = self.task_loss.nc
-        self.no = self.task_loss.no
-        self.reg_max = self.task_loss.reg_max
-        self.device = self.task_loss.device
+        # Get attributes from Detect head (works with both v8DetectionLoss and E2ELoss)
+        detect_head = student_model.model[-1]
+        self.stride = detect_head.stride
+        self.nc = detect_head.nc
+        self.no = detect_head.no
+        self.reg_max = detect_head.reg_max
+        self.device = next(student_model.parameters()).device
 
         self.response_loss = ResponseDistillationLoss(
             temperature=temperature,
@@ -170,39 +178,50 @@ class DistillationLoss:
         # 1. Standard task loss (student vs ground truth)
         task_loss, task_items = self.task_loss(student_preds, batch)
 
-        # 2. Teacher forward pass (no gradient)
+        # 2. Teacher forward pass (triggers hooks to capture backbone features)
         with torch.no_grad():
-            teacher_preds = self.teacher(batch["img"])
+            self.teacher(batch["img"])
 
-        # 3. Extract raw feature maps for response distillation
-        # Student (training mode): preds is already [feat0, feat1, feat2]
-        s_feats = student_preds if isinstance(student_preds, list) else [student_preds]
-        # Teacher (eval mode): preds is (decoded_tensor, [feat0, feat1, feat2])
-        if isinstance(teacher_preds, tuple) and len(teacher_preds) == 2:
-            t_feats = teacher_preds[1]
-            if not isinstance(t_feats, list):
-                t_feats = [t_feats]
-        else:
-            t_feats = teacher_preds if isinstance(teacher_preds, list) else [teacher_preds]
-
-        # 4. Response distillation loss
-        distill_loss = self.response_loss(s_feats, t_feats)
-
-        # 5. Feature distillation loss (optional)
+        # 3. Feature distillation loss (primary distillation via backbone hooks)
         feat_loss = torch.tensor(0.0, device=self.device)
         if self.feature_loss_fn is not None and self.feature_layers:
             feat_loss = self.feature_loss_fn(
                 self.student_features, self.teacher_features, self.feature_layers
             )
 
-        # 6. Combine: (1-alpha)*task + alpha*(response + feature)
-        total_distill = distill_loss + feat_loss
+        # 4. Combine: (1-alpha)*task + alpha*feature_distill
+        total_distill = feat_loss
         combined_loss = (1 - self.alpha) * task_loss + self.alpha * total_distill.expand_as(task_loss)
 
-        # 7. Extend loss items for logging: [box, cls, dfl, distill]
+        # 7. Extend loss items for logging: [task_items..., distill]
         distill_item = total_distill.detach()
         if distill_item.dim() == 0:
             distill_item = distill_item.unsqueeze(0)
         extended_items = torch.cat([task_items, distill_item])
 
         return combined_loss, extended_items
+
+    @staticmethod
+    def _extract_feats(preds):
+        """Extract raw feature map list from model predictions.
+
+        Handles multiple ultralytics output formats:
+        - List/tuple of tensors (v8 training mode)
+        - Dict with "one2many" key (v10/v11 training mode)
+        - Tuple of (decoded, raw) (eval mode)
+        """
+        if isinstance(preds, (list, tuple)) and len(preds) > 0 and isinstance(preds[0], torch.Tensor):
+            return list(preds)
+        if isinstance(preds, dict):
+            # Try known keys first
+            for key in ("one2many", "feats"):
+                v = preds.get(key)
+                if isinstance(v, (list, tuple)) and len(v) > 0 and isinstance(v[0], torch.Tensor):
+                    return list(v)
+            # Fallback: find any list/tuple of tensors in dict values
+            for v in preds.values():
+                if isinstance(v, (list, tuple)) and len(v) > 0 and isinstance(v[0], torch.Tensor):
+                    return list(v)
+        if isinstance(preds, torch.Tensor):
+            return [preds]
+        return []

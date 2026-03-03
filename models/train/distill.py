@@ -57,6 +57,7 @@ class DistillationTrainer(DetectionTrainer):
         self.distill_features = distill_features
         self.feature_layers = feature_layers or []
         self._teacher = None
+        self._original_criterion = None
         self._student_features = {}
         self._teacher_features = {}
         # Newer ultralytics requires cfg to be non-None
@@ -82,7 +83,9 @@ class DistillationTrainer(DetectionTrainer):
 
         # Replace student model's criterion with distillation loss
         student = de_parallel(self.model)
+        self._original_criterion = student.init_criterion()
         student.criterion = DistillationLoss(
+            task_loss=self._original_criterion,
             student_model=student,
             teacher_model=self._teacher,
             temperature=self.temperature,
@@ -93,7 +96,32 @@ class DistillationTrainer(DetectionTrainer):
             teacher_features=self._teacher_features,
         )
 
+        # Set loss_names for training (4 items: 3 task + 1 distill)
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss", "distill_loss"
+
         click.echo(f"[INFO] Distillation loss injected (T={self.temperature}, alpha={self.alpha})")
+
+    def validate(self):
+        """Validate with original criterion (no distillation during validation)."""
+        student = de_parallel(self.model)
+        distill_criterion = student.criterion
+
+        # Swap to original criterion and match loss_items shape for validator
+        student.criterion = self._original_criterion
+        saved_loss_names = self.loss_names
+        saved_loss_items = self.loss_items
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        self.loss_items = torch.zeros(3, device=self.device)
+
+        try:
+            result = super().validate()
+        finally:
+            # Restore distillation criterion for training
+            student.criterion = distill_criterion
+            self.loss_names = saved_loss_names
+            self.loss_items = saved_loss_items
+
+        return result
 
     def _load_teacher(self) -> nn.Module:
         """Load and freeze teacher model."""
@@ -158,7 +186,18 @@ class DistillationTrainer(DetectionTrainer):
         # Add adapter parameters to optimizer
         if any(p.requires_grad for p in feature_loss.parameters()):
             adapter_params = [p for p in feature_loss.parameters() if p.requires_grad]
-            self.optimizer.add_param_group({"params": adapter_params, "weight_decay": 0.0})
+            lr = self.args.lr0
+            self.optimizer.add_param_group({
+                "params": adapter_params, "weight_decay": 0.0,
+                "lr": lr, "initial_lr": lr,
+            })
+            # Sync scheduler with new param group to avoid zip() length mismatch
+            if hasattr(self, "scheduler") and self.scheduler is not None:
+                self.scheduler.base_lrs.append(lr)
+                if hasattr(self.scheduler, "_last_lr"):
+                    self.scheduler._last_lr.append(lr)
+                if hasattr(self.scheduler, "lr_lambdas"):
+                    self.scheduler.lr_lambdas.append(self.scheduler.lr_lambdas[-1])
             click.echo(f"  Added {len(adapter_params)} adapter parameters to optimizer")
 
         return feature_loss
@@ -188,13 +227,18 @@ class DistillationTrainer(DetectionTrainer):
         def hook(module, input, output):
             if isinstance(output, torch.Tensor):
                 storage[idx] = output
+            elif isinstance(output, (list, tuple)):
+                for item in output:
+                    if isinstance(item, torch.Tensor):
+                        storage[idx] = item
+                        break
         return hook
 
     def get_validator(self):
         """Return validator with extended loss names for distillation."""
-        self.loss_names = "box_loss", "cls_loss", "dfl_loss", "distill_loss"
         validator = super().get_validator()
-        # Reset parent's loss_names back so validator works correctly
+        # super() resets loss_names to 3; restore 4 for training progress
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss", "distill_loss"
         return validator
 
     def label_loss_items(self, loss_items=None, prefix="train"):
