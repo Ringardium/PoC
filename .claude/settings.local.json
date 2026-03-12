@@ -35,7 +35,12 @@
       "Bash(git mv main_multi.py legacy/main_multi.py && git mv multi_stream_processor.py legacy/multi_stream_processor.py && git mv optimized_tracking.py legacy/optimized_tracking.py && git rm detect_escape.py)",
       "Bash(ls -la /Users/kihunnam/Desktop/Garin/code/PoC/__pycache__/config* 2>/dev/null)",
       "Bash(git commit -m \"$\\(cat <<'EOF'\nImprove behavior detection, ReID stability, and canvas drawing\n\n- Global ID based behavior detection \\(persist across ID switches\\)\n- Fix displacement calc to use sqrt for real px distances\n- Add speed threshold for active detection, raise thresholds for less sensitivity\n- Fix duplicate global ID assignment with exclude_gids\n- Fix ReID correcting multiple tracks to same ID\n- Add ID stabilization buffer and correction cooldown\n- Draw normal \\(green\\) bbox for all tracked pets, label only on behavior\n- Add HLS uploader debug logging\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
-      "Bash(git push)"
+      "Bash(git push)",
+      "WebSearch",
+      "WebFetch(domain:docs.ultralytics.com)",
+      "Bash(cd:*)",
+      "Bash(cd C:\\\\Users\\\\garin\\\\Documents\\\\업무\\\\떠나펫\\\\code\\\\pet_tracker_final:*)",
+      "Bash(df -h /c/Users/garin/Documents/업무/떠나펫/code/pet_tracker_final 2>/dev/null || df -h / 2>/dev/null || echo \"checking disk space...\" && powershell.exe -Command \"Get-PSDrive C | Select-Object Used,Free\" 2>/dev/null)"
     ]
   }
 }
