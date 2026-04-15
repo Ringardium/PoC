@@ -103,34 +103,38 @@ class ModelOptimizer:
 
         return optimized_models
 
-    def _optimize_for_mobile(self, output_path: str, optimization_level: str) -> str:
-        """Optimize for mobile deployment"""
+    def _optimize_for_mobile(self, output_path: str, optimization_level: str,
+                             data_dir: Optional[str] = None) -> str:
+        """
+        Optimize for mobile deployment.
+
+        optimization_level:
+          'fast'   → float16 TFLite (GPU delegate 용)
+          'medium' → float16 TFLite
+          'best'   → INT8 full-quant TFLite (NPU delegate 용)
+        """
         try:
-            from model_converter import YOLOToTFLiteConverter
+            from .converter import YOLOToTFLiteConverter
 
             converter = YOLOToTFLiteConverter(self.model_path)
 
-            # Choose quantization based on optimization level
-            quantization_map = {
-                "fast": "dynamic",
-                "medium": "float16",
-                "best": "int8"
-            }
-
-            quantization = quantization_map.get(optimization_level, "float16")
-
-            # Create representative dataset for int8 quantization
-            representative_dataset = None
-            if quantization == "int8":
-                # Generate representative data
-                representative_dataset = self._generate_representative_data()
-
-            return converter.convert_to_tflite(
-                output_path,
-                quantization=quantization,
-                optimize_for_size=True,
-                representative_dataset=representative_dataset
-            )
+            if optimization_level == "best":
+                # NPU-friendly INT8 경로
+                if data_dir is None:
+                    print("[경고] INT8 변환에 data_dir이 없습니다. "
+                          "representative dataset 없이는 정확도가 떨어질 수 있습니다.")
+                return converter.convert_npu_int8(
+                    output_path,
+                    data_dir=data_dir,
+                    num_samples=300,
+                )
+            else:
+                # float16 경로 (GPU delegate / 범용)
+                return converter.convert_to_tflite(
+                    output_path,
+                    quantization="float16",
+                    optimize_for_size=True,
+                )
 
         except Exception as e:
             print(f"Mobile optimization failed: {e}")
@@ -277,15 +281,19 @@ class ModelOptimizer:
             print(f"ONNX optimization failed: {e}")
 
     def _generate_representative_data(self, num_samples: int = 100) -> List[np.ndarray]:
-        """Generate representative data for quantization"""
-        # Create random data that matches typical input
+        """
+        [Deprecated] 랜덤 데이터 기반 representative dataset.
+
+        랜덤 이미지는 실제 도메인 분포를 반영하지 못해 INT8 calibration 품질이
+        낮아집니다. 실제 사용 시 data_dir에 도메인 이미지를 제공하세요.
+        """
+        print("[경고] 랜덤 이미지로 calibration합니다. "
+              "실제 도메인 이미지(data_dir)를 사용하면 정확도가 크게 향상됩니다.")
         representative_data = []
         for _ in range(num_samples):
-            # Generate random image data
             image = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
             image = image.astype(np.float32) / 255.0
             representative_data.append(image)
-
         return representative_data
 
     def benchmark_models(

@@ -12,7 +12,7 @@ class StreamConfig:
     stream_id: str
     input_source: str  # video file, RTSP URL, or webcam index (e.g., "0")
     output_path: Optional[str] = None
-    method: str = "bytetrack"  # bytetrack, botsort, deepsort
+    method: str = "bytetrack"  # bytetrack, botsort, deepsort, ocsort
     task_fight: bool = True
     task_escape: bool = False
     task_inert: bool = True
@@ -64,6 +64,14 @@ class StreamConfig:
     privacy: bool = False                # 사람 감지 후 프라이버시 필터 적용
     privacy_method: str = "blur"         # blur, mosaic, black
     privacy_model: str = "yolo11n.pt"    # 사람 감지용 YOLO 모델 경로
+    # Adaptive FPS (컨텐츠 기반 YOLO 추론 주기 자동 조절)
+    # ProcessingConfig.enable_adaptive_skip(처리시간 기반)과 독립적으로 동작
+    adaptive_fps_enabled: bool = False   # False = 항상 매 프레임 YOLO 실행
+    adaptive_fps_max: float = 10.0       # 활발할 때 최대 분석 FPS
+    adaptive_fps_min: float = 0.1        # 객체 없을 때 최소 분석 FPS (= 10초에 1회)
+    adaptive_fps_idle: float = 1.0       # 객체 있지만 조용할 때 분석 FPS
+    adaptive_fps_displacement_low: float = 5.0   # 저움직임 임계값 (px/frame)
+    adaptive_fps_displacement_high: float = 50.0 # 고움직임 임계값 (px/frame)
 
     def to_dict(self) -> dict:
         d = asdict(self)

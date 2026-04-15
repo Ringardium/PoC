@@ -33,3 +33,4 @@ Thumbs.db
 *.jpeg
 # Keep emoji assets
 !assets/emoji/*.png
+npu/

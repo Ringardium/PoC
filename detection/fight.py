@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 
+
 def compute_iou_matrix_vectorized(boxes):
     boxes = np.array(boxes)  # shape (n, 4)
     x1 = boxes[:, 0][:, None]
@@ -41,22 +42,28 @@ def detect_fight(
     close_count,
     far_count,
     threshold,
-    reset_frames,
-    flag_frames,
+    reset_seconds,
+    flag_seconds,
     width,
     height,
+    dt: float = 1 / 30,
     speeds=None,
-    fight_speed_threshold=5.0,
+    fight_speed_threshold_px_sec: float = 150.0,
 ):
     """Detect fighting between pets.
 
+    Time-based: close_count / far_count accumulate real seconds (``+= dt``) so
+    the detection is FPS-independent.  reset_seconds / flag_seconds are in
+    seconds (convert from frames: frames / target_fps).
+
     Args:
-        speeds: dict mapping track_id -> average speed (pixels/frame).
+        dt: elapsed seconds since the last analysis frame (1/analysis_fps).
+        speeds: dict mapping track_id -> average speed in **px/sec**.
             When provided, close_count only increments if BOTH dogs in the
-            pair exceed ``fight_speed_threshold``.  This filters out calm
-            proximity (resting together, playing gently).
-        fight_speed_threshold: minimum average speed for both dogs to count
-            as a fighting interaction.
+            pair exceed ``fight_speed_threshold_px_sec``.  This filters out
+            calm proximity (resting together, playing gently).
+        fight_speed_threshold_px_sec: minimum speed (px/sec) for both dogs
+            to count as a fighting interaction.
     """
 
     bbox_coor = np.stack((x_centers - width / 2, y_centers - height / 2, x_centers + width / 2, y_centers + height / 2), axis=1)
@@ -71,7 +78,7 @@ def detect_fight(
         if speeds is not None:
             speed_i = speeds.get(id_i, 0.0)
             speed_j = speeds.get(id_j, 0.0)
-            if speed_i < fight_speed_threshold or speed_j < fight_speed_threshold:
+            if speed_i < fight_speed_threshold_px_sec or speed_j < fight_speed_threshold_px_sec:
                 continue
 
         tracked_ids.append((id_i, id_j))
@@ -88,15 +95,16 @@ def detect_fight(
         close_count = new_close
         far_count = new_far
 
-    far_count += 1
+    # Accumulate time (seconds) instead of frame counts
+    far_count += dt
     for i, j in tracked_ids:
         far_count[i, j] = 0
         far_count[j, i] = 0
 
     for i, j in tracked_ids:
-        close_count[i, j] += 1
-        close_count[j, i] += 1
+        close_count[i, j] += dt
+        close_count[j, i] += dt
 
-    check = close_count * (far_count < reset_frames)
+    check = close_count * (far_count < reset_seconds)
 
-    return triu_where(check > flag_frames, check), close_count, far_count
+    return triu_where(check > flag_seconds, check), close_count, far_count

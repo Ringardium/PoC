@@ -61,6 +61,7 @@ class SyncClock:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import apply_blur, apply_mosaic, apply_black_box
+from tools.adaptive_fps import AdaptiveFPSController
 
 
 class StreamState:
@@ -129,6 +130,9 @@ class StreamState:
         self.last_person_boxes: list = []
         # Class stabilization: {track_id: {'cls': int, 'candidate': int, 'count': int}}
         self.track_class_buffer: Dict[int, Dict] = {}
+        # Adaptive FPS controller (컨텐츠 기반 YOLO skip, config.adaptive_fps_enabled=True 시 초기화)
+        self.adaptive_fps_ctrl: Optional[AdaptiveFPSController] = None
+        self.last_analysis_time: float = 0.0  # AdaptiveFPSController용 마지막 분석 시각
 
     def init_behavior_state(self, max_number: int = 500):
         self.close_count = torch.zeros((max_number, max_number))
@@ -396,6 +400,22 @@ class MultiStreamProcessor:
         if needs_behavior:
             state.init_behavior_state()
 
+        # Init AdaptiveFPSController (컨텐츠 기반 YOLO skip)
+        if sc.adaptive_fps_enabled:
+            state.adaptive_fps_ctrl = AdaptiveFPSController(
+                max_fps=sc.adaptive_fps_max,
+                min_fps=sc.adaptive_fps_min,
+                idle_fps=sc.adaptive_fps_idle,
+                displacement_low=sc.adaptive_fps_displacement_low,
+                displacement_high=sc.adaptive_fps_displacement_high,
+            )
+            state.last_analysis_time = 0.0
+            logger.info(
+                f"[{stream_id}] AdaptiveFPS enabled — "
+                f"max={sc.adaptive_fps_max}, idle={sc.adaptive_fps_idle}, "
+                f"min={sc.adaptive_fps_min} fps"
+            )
+
         # Init DeepSORT if needed
         if needs_yolo and sc.method == "deepsort":
             from deep_sort import nn_matching
@@ -554,7 +574,25 @@ class MultiStreamProcessor:
                     if needs_yolo:
                         run_yolo = True
                         state._frames_since_yolo += 1
-                        if self.config.processing.enable_adaptive_skip and state.skip_counter > 0:
+
+                        # 1) 컨텐츠 기반 skip (AdaptiveFPSController) — 조용할 때 YOLO 자체를 건너뜀
+                        if state.adaptive_fps_ctrl is not None:
+                            if not state.adaptive_fps_ctrl.should_analyze(state.last_analysis_time):
+                                run_yolo = False
+                                boxes = self._interpolate_boxes(state)
+                                track_ids = state.last_track_ids
+                                bowl_boxes = state.last_bowl_boxes
+                                if sc.privacy and state.last_person_boxes:
+                                    for px1, py1, px2, py2 in state.last_person_boxes:
+                                        if sc.privacy_method == "mosaic":
+                                            frame = apply_mosaic(frame, px1, py1, px2, py2)
+                                        elif sc.privacy_method == "black":
+                                            frame = apply_black_box(frame, px1, py1, px2, py2)
+                                        else:
+                                            frame = apply_blur(frame, px1, py1, px2, py2)
+
+                        # 2) 처리시간 기반 skip (enable_adaptive_skip) — 처리가 늦을 때 프레임 skip
+                        if run_yolo and self.config.processing.enable_adaptive_skip and state.skip_counter > 0:
                             # Skip YOLO — reuse cached results with linear interpolation
                             state.skip_counter -= 1
                             boxes = self._interpolate_boxes(state)
@@ -593,6 +631,29 @@ class MultiStreamProcessor:
                             state.last_boxes = boxes
                             state.last_track_ids = track_ids
                             state.last_bowl_boxes = bowl_boxes
+
+                            # Update AdaptiveFPSController (컨텐츠 기반 다음 skip 결정)
+                            if state.adaptive_fps_ctrl is not None:
+                                state.last_analysis_time = time.time()
+                                num_objs = len(track_ids) if track_ids else 0
+                                # 평균 변위 계산 (track_id별 이전 중심과의 거리)
+                                avg_disp = 0.0
+                                if num_objs > 0 and state.prev_centers:
+                                    disps = []
+                                    for tid, box in zip(track_ids, boxes):
+                                        prev = state.prev_centers.get(tid)
+                                        if prev is not None:
+                                            cx = box[0] if not hasattr(box, 'tolist') else box.tolist()[0]
+                                            cy = box[1] if not hasattr(box, 'tolist') else box.tolist()[1]
+                                            dx, dy = cx - prev[0], cy - prev[1]
+                                            disps.append((dx * dx + dy * dy) ** 0.5)
+                                    if disps:
+                                        avg_disp = sum(disps) / len(disps)
+                                state.adaptive_fps_ctrl.update(
+                                    num_objects=num_objs,
+                                    avg_displacement=avg_disp,
+                                    has_event=False,  # 행동 감지 후 갱신 필요 시 _run_behavior_detection에서 처리
+                                )
 
                             # Decide how many frames to skip based on processing load
                             if self.config.processing.enable_adaptive_skip:

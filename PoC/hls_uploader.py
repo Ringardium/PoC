@@ -2,6 +2,7 @@
 
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
@@ -65,11 +66,20 @@ class HLSUploader:
         self._playlist_segments: Set[str] = set()  # segments referenced by current m3u8
         self._running = True
 
+        # Non-blocking frame queue (drop oldest when full to prevent main loop stall)
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=fps * 2)
+
         # Clean up any leftover S3 files from previous runs
         self._purge_s3()
 
         # Start FFmpeg process
         self._proc = self._start_ffmpeg()
+
+        # Start FFmpeg feeder thread (drains _frame_queue → FFmpeg stdin)
+        self._feeder_thread = threading.Thread(
+            target=self._feeder_worker, daemon=True
+        )
+        self._feeder_thread.start()
 
         # Start S3 upload watcher thread
         self._upload_thread = threading.Thread(
@@ -155,17 +165,37 @@ class HLSUploader:
         logger.info(f"[{self._stream_id}] FFmpeg restarted: PID {self._proc.pid}")
 
     def write_frame(self, frame: np.ndarray):
-        """Write a single BGR frame to FFmpeg stdin. Auto-restarts on failure."""
-        if self._proc.poll() is not None:
-            # FFmpeg died — restart
-            self._restart_ffmpeg()
-        if self._proc.stdin is None:
-            return
+        """Enqueue a frame for FFmpeg. Non-blocking — drops oldest frame if queue full."""
         try:
-            self._proc.stdin.write(frame.tobytes())
-        except (BrokenPipeError, OSError) as e:
-            logger.warning(f"[{self._stream_id}] FFmpeg write error: {e}, restarting")
-            self._restart_ffmpeg()
+            self._frame_queue.put_nowait(frame.tobytes())
+        except queue.Full:
+            # Drop oldest frame to keep latency low
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._frame_queue.put_nowait(frame.tobytes())
+            except queue.Full:
+                pass
+
+    def _feeder_worker(self):
+        """Background thread: drain frame queue → FFmpeg stdin."""
+        while self._running:
+            try:
+                data = self._frame_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            if self._proc.poll() is not None:
+                self._restart_ffmpeg()
+            if self._proc.stdin is None:
+                continue
+            try:
+                self._proc.stdin.write(data)
+            except (BrokenPipeError, OSError) as e:
+                logger.warning(f"[{self._stream_id}] FFmpeg write error: {e}, restarting")
+                self._restart_ffmpeg()
 
     def _upload_worker(self):
         """Watch local HLS dir and upload new files to S3."""
@@ -255,6 +285,9 @@ class HLSUploader:
     def stop(self):
         """Shutdown FFmpeg, delete all S3 files, and clean up."""
         self._running = False
+
+        # Wait for feeder thread to drain remaining frames
+        self._feeder_thread.join(timeout=5.0)
 
         # Close FFmpeg stdin to trigger graceful exit
         if self._proc.stdin:

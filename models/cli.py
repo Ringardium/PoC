@@ -5,8 +5,14 @@ from pathlib import Path
 from typing import List, Optional
 
 from ultralytics import YOLO
-from models.lightning_training import LightningTrainer, quick_train_setup
-from models.lightning_inference import LightningYOLOInference
+
+try:
+    from models.lightning_training import LightningTrainer, quick_train_setup
+    from models.lightning_inference import LightningYOLOInference
+except Exception:
+    LightningTrainer = None
+    quick_train_setup = None
+    LightningYOLOInference = None
 
 
 @click.group()
@@ -66,6 +72,58 @@ def export(model: str, output: Optional[str], format: str, optimize: bool, half:
 
     except Exception as e:
         click.echo(f"❌ Export failed: {e}")
+
+
+@mobile.command("npu-int8")
+@click.option("--model", required=True, help="Path to YOLO model (.pt)")
+@click.option("--data", required=True, help="Calibration 이미지 디렉토리")
+@click.option("--output", required=True, help="출력 .tflite 경로")
+@click.option("--input-size", default=640, help="모델 입력 해상도 (default: 640)")
+@click.option("--samples", default=420, help="Calibration 샘플 수 (default: 420 = 전체)")
+def npu_int8(model: str, data: str, output: str, input_size: int, samples: int):
+    """NPU-friendly INT8 TFLite 변환 (NMS 제외, static shape, SELECT_TF_OPS 없음)"""
+    from .converter import YOLOToTFLiteConverter
+
+    click.echo(f"[NPU INT8] {model} → {output}")
+    click.echo(f"  calibration: {data} ({samples}장)")
+    click.echo(f"  input size : {input_size}x{input_size}")
+
+    try:
+        converter = YOLOToTFLiteConverter(model)
+        result = converter.convert_npu_int8(
+            output_path=output,
+            input_size=input_size,
+            data_dir=data,
+            num_samples=samples,
+        )
+        click.echo(f"✅ 완료: {result}")
+        click.echo("delegate coverage 확인:")
+        converter.verify_npu_coverage(result)
+    except Exception as e:
+        click.echo(f"❌ 실패: {e}")
+
+
+@mobile.command("compare")
+@click.option("--pt",      required=True, help="원본 YOLO .pt 경로")
+@click.option("--tflite",  required=True, help="변환된 .tflite 경로")
+@click.option("--data",    default=None,  help="mAP용 data.yaml 경로 (없으면 속도만 측정)")
+@click.option("--image",   default=None,  help="속도 테스트용 이미지 (없으면 랜덤 텐서)")
+@click.option("--imgsz",   default=640,   help="추론 해상도 (default: 640)")
+@click.option("--runs",    default=100,   help="속도 측정 반복 횟수 (default: 100)")
+def compare(pt: str, tflite: str, data: Optional[str], image: Optional[str], imgsz: int, runs: int):
+    """원본 YOLO vs TFLite mAP + 속도 비교"""
+    from .benchmark import benchmark_map, benchmark_speed
+
+    if data:
+        try:
+            benchmark_map(pt, tflite, data, imgsz=imgsz)
+        except Exception as e:
+            click.echo(f"❌ mAP 벤치마크 실패: {e}")
+
+    try:
+        benchmark_speed(pt, tflite, imgsz=imgsz, num_runs=runs, image_path=image)
+    except Exception as e:
+        click.echo(f"❌ 속도 벤치마크 실패: {e}")
 
 
 @mobile.command()

@@ -5,7 +5,8 @@ lap
 click
 av
 psutil
-tensorflow
+tensorflow-macos
+tensorflow-metal
 onnx
 onnx2tf
 onnxruntime

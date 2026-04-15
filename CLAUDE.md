@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```
 ├── main.py                  # 싱글 스트림 CLI (Click)
-├── tracking.py              # ByteTrack / BotSORT / DeepSORT 트래커
+├── tracking.py              # ByteTrack / BotSORT / DeepSORT / OCSort 트래커
 ├── bytetrack.yaml           # ByteTrack 설정
 ├── botsort.yaml             # BotSORT 설정
 │
@@ -50,6 +50,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ├── tools/                   # 유틸리티
 │   ├── privacy_filter.py    # 프라이버시 필터 (blur/mosaic/black)
 │   ├── pet_profiles.py      # 펫 프로필 CRUD (JSON)
+│   ├── adaptive_fps.py      # 컨텐츠 기반 적응형 FPS 컨트롤러
+│   ├── overlay.py           # 분석/표시 분리용 오버레이 캐싱
 │   ├── coord_picker.py      # ROI 좌표 선택기
 │   └── generate_emoji.py    # 이모지 PNG 생성
 │
@@ -104,7 +106,12 @@ python tools/privacy_filter.py --input video.mp4 --output output.mp4 --method bl
 - Pet class ID = `1`, Bowl class ID = `3`
 - `task_eat=True` → yolo_classes에 class 3 자동 추가
 - 모든 행동 감지 모듈은 독립적 (cross-import 없음)
-- tracking.py의 3개 트래커는 동일 인터페이스 반환: `(boxes, track_ids, frame)`
+- tracking.py의 4개 트래커는 동일 인터페이스 반환: `(boxes, track_ids, frame)`
+  - OCSort는 `initialize_ocsort_tracker()` 로 인스턴스 생성 후 `track_with_ocsort()` 사용
+  - OCSort 의존성: `pip install fast-deep-oc-sort`
+- `adaptive_fps_enabled=True` 설정 시 컨텐츠 기반 YOLO skip 활성화
+  - 객체 없음 → min_fps, 조용함 → idle_fps, 활발/이벤트 → max_fps
+  - `enable_adaptive_skip`(처리시간 기반)과 독립적으로 레이어링됨
 
 ## Import 패턴
 
@@ -117,7 +124,24 @@ from reid import ReIDTracker
 
 # 유틸리티
 from tools import apply_blur, apply_mosaic, apply_black_box
+from tools import AdaptiveFPSController, build_overlay_cache, draw_cached_overlay
 from tools.pet_profiles import PetProfileStore
+
+# OCSort 트래커
+from tracking import initialize_ocsort_tracker, track_with_ocsort
+ocsort = initialize_ocsort_tracker()  # 선택적 config dict 전달 가능
+boxes, track_ids, frame = track_with_ocsort(model, ocsort, frame)
+
+# 적응형 FPS (독립 사용 예)
+ctrl = AdaptiveFPSController(max_fps=10, idle_fps=1.0, min_fps=0.1)
+if ctrl.should_analyze(last_analysis_time):
+    # YOLO 추론 실행
+    last_analysis_time = time.time()
+    ctrl.update(num_objects=len(track_ids), avg_displacement=avg_disp, has_event=has_event)
+
+# 오버레이 캐싱 (분석/표시 분리)
+cached = build_overlay_cache(boxes, track_ids, fight_boxes=..., sleep_boxes=..., fps_info=ctrl.get_status())
+display_frame = draw_cached_overlay(frame.copy(), cached)
 ```
 
 ## Behavior Detection Reference

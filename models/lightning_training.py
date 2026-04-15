@@ -17,6 +17,7 @@ try:
     LIGHTNING_AVAILABLE = True
 except ImportError:
     LIGHTNING_AVAILABLE = False
+    pl = None
     print("PyTorch Lightning not available. Install with: pip install pytorch-lightning")
 
 try:
@@ -27,8 +28,10 @@ except ImportError:
     ULTRALYTICS_AVAILABLE = False
     print("Ultralytics not available. Install with: pip install ultralytics")
 
+_BaseModule = pl.LightningModule if LIGHTNING_AVAILABLE else nn.Module
 
-class YOLOLightningModule(pl.LightningModule):
+
+class YOLOLightningModule(_BaseModule):
     """PyTorch Lightning wrapper for YOLO training"""
 
     def __init__(
