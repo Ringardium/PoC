@@ -1418,7 +1418,7 @@ class MultiStreamProcessor:
                 sc.threshold, sc.reset_frames, sc.flag_frames,
                 last_w, last_h,
                 speeds=speeds,
-                fight_speed_threshold=sc.fight_speed_threshold,
+                fight_speed_threshold_px_sec=sc.fight_speed_threshold,
             )
             for ids in fight_indices:
                 for i in ids:
