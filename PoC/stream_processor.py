@@ -1368,13 +1368,13 @@ class MultiStreamProcessor:
             x_centers.append(xc)
             y_centers.append(yc)
             last_w, last_h = int(w), int(h)
-            state.inert_coor[bid].append([xc, yc])
+            state.inert_coor[bid].append([state.frame_timestamp, xc, yc])
             state.sleep_coor[bid].append([state.frame_timestamp, xc, yc])
             state.sleep_bbox[bid].append([state.frame_timestamp, w, h])
             state.eat_coor[bid].append([xc, yc])
             state.bathroom_coor[bid].append([xc, yc])
             state.bathroom_bbox[bid].append([w, h])
-            state.active_coor[bid].append([xc, yc])
+            state.active_coor[bid].append([state.frame_timestamp, xc, yc])
 
         x_arr = np.array(x_centers)
         y_arr = np.array(y_centers)
@@ -1401,10 +1401,12 @@ class MultiStreamProcessor:
         for tid in track_ids:
             bid = tid_to_bid[tid]
             if bid in state.inert_coor and len(state.inert_coor[bid]) >= 2:
-                coor = np.array(state.inert_coor[bid])
+                coor = np.array(state.inert_coor[bid])  # (N, 3): [t, x, y]
                 recent = coor[-min(10, len(coor)):]
-                dists = np.sqrt(np.sum((recent[1:] - recent[:-1]) ** 2, axis=1))
-                speeds[tid] = float(np.mean(dists))
+                xy = recent[:, 1:3]
+                dists = np.sqrt(np.sum((xy[1:] - xy[:-1]) ** 2, axis=1))
+                dts = np.maximum(np.diff(recent[:, 0]), 1e-6)
+                speeds[tid] = float(np.mean(dists / dts))
             else:
                 speeds[tid] = 0.0
 
@@ -1529,7 +1531,7 @@ class MultiStreamProcessor:
         if sc.task_active:
             active_ids = detect_active(
                 state.active_coor, sc.active_threshold, sc.active_frames,
-                speed_threshold=sc.active_speed_threshold,
+                speed_threshold_px_sec=sc.active_speed_threshold,
             )
             active_set = set(active_ids)
             if len(active_set) > 0:
