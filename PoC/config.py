@@ -124,6 +124,11 @@ class SystemConfig:
     clip_pre_seconds: float = 2.0        # 이벤트 전 녹화 시간 (초)
     clip_post_seconds: float = 2.0       # 이벤트 후 녹화 시간 (초)
     cdn_base_url: Optional[str] = None   # CDN base URL (e.g. "https://cdn.mungwoofai.cloud")
+    # Mobile overlay metadata push (disabled by default — no behavior change when off)
+    metadata_ws_enabled: bool = False    # True = start WebSocket server for bbox/behavior metadata
+    metadata_ws_host: str = "0.0.0.0"
+    metadata_ws_port: int = 8766
+    metadata_ws_path: str = "/ws/metadata"
 
     def to_dict(self) -> dict:
         data = {
@@ -143,6 +148,10 @@ class SystemConfig:
             "clip_pre_seconds": self.clip_pre_seconds,
             "clip_post_seconds": self.clip_post_seconds,
             "cdn_base_url": self.cdn_base_url,
+            "metadata_ws_enabled": self.metadata_ws_enabled,
+            "metadata_ws_host": self.metadata_ws_host,
+            "metadata_ws_port": self.metadata_ws_port,
+            "metadata_ws_path": self.metadata_ws_path,
         }
         return data
 
@@ -171,6 +180,10 @@ class SystemConfig:
             clip_pre_seconds=data.get("clip_pre_seconds", 2.0),
             clip_post_seconds=data.get("clip_post_seconds", 2.0),
             cdn_base_url=data.get("cdn_base_url"),
+            metadata_ws_enabled=data.get("metadata_ws_enabled", False),
+            metadata_ws_host=data.get("metadata_ws_host", "0.0.0.0"),
+            metadata_ws_port=data.get("metadata_ws_port", 8766),
+            metadata_ws_path=data.get("metadata_ws_path", "/ws/metadata"),
         )
 
     def save(self, path: str):

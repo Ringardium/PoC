@@ -186,6 +186,20 @@ class MultiStreamProcessor:
         # Privacy filter YOLO model (shared across streams)
         self._privacy_model = None
 
+        # Optional metadata broadcaster (mobile overlay)
+        self._metadata_sender = None
+        if getattr(config, "metadata_ws_enabled", False):
+            try:
+                from metadata_sender import MetadataSender
+                self._metadata_sender = MetadataSender(
+                    host=config.metadata_ws_host,
+                    port=config.metadata_ws_port,
+                    path=config.metadata_ws_path,
+                )
+            except Exception as e:
+                logger.warning(f"MetadataSender init failed, disabling: {e}")
+                self._metadata_sender = None
+
         # Register initial streams
         for sc in config.streams:
             self._register_stream(sc)
@@ -294,6 +308,9 @@ class MultiStreamProcessor:
 
         self._load_models()
 
+        if self._metadata_sender is not None:
+            self._metadata_sender.start()
+
         # Start per-stream loops
         for sid in list(self.streams):
             task = asyncio.create_task(self._stream_loop(sid))
@@ -336,6 +353,8 @@ class MultiStreamProcessor:
         for clip_rec in self._clip_recorders.values():
             clip_rec.stop()
         self._clip_recorders.clear()
+        if self._metadata_sender is not None:
+            self._metadata_sender.stop()
 
     # ------------------------------------------------------------------
     # Per-stream processing loop
@@ -1057,9 +1076,9 @@ class MultiStreamProcessor:
 
     @staticmethod
     def _is_live_stream(source: str) -> bool:
-        """Check if the source is a live stream (RTSP or RTMP) that should auto-reconnect."""
+        """Check if the source is a live stream (RTSP/RTMP/WHEP) that should auto-reconnect."""
         s = source.lower()
-        return s.startswith("rtsp://") or s.startswith("rtmp://")
+        return s.startswith(("rtsp://", "rtmp://", "whep://", "webrtc://"))
 
     @staticmethod
     def _is_rtsp(source: str) -> bool:
@@ -1073,6 +1092,24 @@ class MultiStreamProcessor:
     @staticmethod
     def _do_open_capture(source: str) -> Optional[cv2.VideoCapture]:
         t0 = time.perf_counter()
+        s_lower = source.lower()
+        if s_lower.startswith("whep://") or s_lower.startswith("webrtc://"):
+            try:
+                from whep_reader import WHEPCapture
+            except ImportError as e:
+                logger.error(f"[capture] WHEP requires aiortc/aiohttp: {e}")
+                return None
+            try:
+                cap = WHEPCapture(source)
+                if not cap.open():
+                    logger.warning(f"[capture] WHEP open timeout: {source}")
+                    cap.release()
+                    return None
+            except Exception as e:
+                logger.warning(f"[capture] WHEP failed: {source} — {e}")
+                return None
+            logger.info(f"[capture] WHEP opened in {time.perf_counter() - t0:.1f}s: {source}")
+            return cap
         if source.isdigit():
             cap = cv2.VideoCapture(int(source))
         elif source.lower().startswith("rtsp://"):
@@ -1607,6 +1644,30 @@ class MultiStreamProcessor:
                 cv2.rectangle(frame, (pt1[0], pt1[1] - th - 10), (pt1[0] + tw, pt1[1]), color, -1)
                 cv2.putText(frame, display_label, (pt1[0], pt1[1] - 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        # Mobile overlay metadata push (off unless metadata_ws_enabled=True)
+        if self._metadata_sender is not None:
+            # Prefer source-aligned wallclock from WHEP when available; fall back to SyncClock stamp
+            ts = state.frame_timestamp
+            src_ts = getattr(state.cap, "get_last_wallclock", lambda: None)()
+            if src_ts is not None:
+                ts = src_ts
+            meta_tracks = []
+            for tid, box in zip(track_ids, boxes):
+                if hasattr(box, 'tolist'):
+                    bx = box.tolist()
+                else:
+                    bx = list(box)
+                gid = state.global_id_map.get(tid)
+                bid = tid_to_bid.get(tid, tid)
+                meta_tracks.append({
+                    "tid": int(tid),
+                    "gid": int(gid) if gid is not None else None,
+                    "pet_name": state.global_id_names.get(gid) if gid is not None else None,
+                    "bbox_xywh": [float(bx[0]), float(bx[1]), float(bx[2]), float(bx[3])],
+                    "behavior": dog_behavior.get(bid, "normal"),
+                })
+            self._metadata_sender.push_frame(sc.stream_id, ts, meta_tracks)
 
         return frame
 

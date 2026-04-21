@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show *)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(f'{s[\\\\\"name\\\\\"]:50s} app={s[\\\\\"app\\\\\"]:10s} publish.active={s[\\\\\"publish\\\\\"][\\\\\"active\\\\\"]}'\\) for s in d.get\\('streams',[]\\)]\")",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}
