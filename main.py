@@ -556,15 +556,15 @@ def annotate_frame_with_supervision(
 @click.option("--inert-frames", default=100)
 @click.option("--sleep-threshold", default=30)
 @click.option("--sleep-frames", default=200)
-@click.option("--sleep-aspect-ratio", default=1.2)
+@click.option("--sleep-aspect-ratio", default=0.0, help="0 = 비활성 (카메라 각도 편차가 있을 때 권장)")
 @click.option("--sleep-area-stability", default=0.15)
 @click.option("--eat-iou-threshold", default=0.3)
 @click.option("--eat-dwell-frames", default=30)
-@click.option("--eat-direction-frames", default=10)
+@click.option("--eat-direction-frames", default=0, help="0 = 비활성 (각도 편차 대응). overlap+dwell만 사용")
 @click.option("--bowl-conf", default=0.5)
 @click.option("--bathroom-cls-model", default="weights/bathroom_cls.pt")
 @click.option("--bathroom-trigger-frames", default=30)
-@click.option("--bathroom-height-drop", default=0.25)
+@click.option("--bathroom-area-drop", default=0.25, help="bbox 투영 면적 감소율 임계값 (angle-invariant)")
 @click.option("--bathroom-cls-conf", default=0.5)
 @click.option("--reset-frames", default=60)
 @click.option("--flag-frames", default=4)
@@ -600,7 +600,7 @@ def main(
     bowl_conf,
     bathroom_cls_model,
     bathroom_trigger_frames,
-    bathroom_height_drop,
+    bathroom_area_drop,
     bathroom_cls_conf,
     reset_frames,
     flag_frames,
@@ -895,7 +895,7 @@ def main(
                     frame,
                     bathroom_cls_model,
                     bathroom_trigger_frames,
-                    bathroom_height_drop,
+                    bathroom_area_drop,
                     cls_confidence=bathroom_cls_conf,
                 )
 

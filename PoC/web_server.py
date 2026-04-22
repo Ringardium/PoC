@@ -19,6 +19,16 @@ from typing import Optional
 
 import click
 
+# Install uvloop if available (Linux, 2-3x faster than default asyncio selector).
+# Safe no-op on macOS / Windows or when uvloop is not installed.
+_UVLOOP_ACTIVE = False
+try:
+    import uvloop
+    uvloop.install()
+    _UVLOOP_ACTIVE = True
+except ImportError:
+    pass
+
 from config import SystemConfig, StreamConfig
 from stream_processor import MultiStreamProcessor
 
@@ -205,6 +215,8 @@ def main(config: str, port: int, host: str, no_web: bool):
     """Start the web viewer with multi-stream processing"""
 
     logger.info(f"Loading configuration from {config}")
+    if _UVLOOP_ACTIVE:
+        logger.info("uvloop enabled")
     sys_config = SystemConfig.load(config)
 
     if not sys_config.streams:
@@ -245,6 +257,7 @@ def main(config: str, port: int, host: str, no_web: bool):
                 host=host,
                 port=port,
                 log_level="info",
+                loop="uvloop" if _UVLOOP_ACTIVE else "auto",
             )
         except KeyboardInterrupt:
             logger.info("Interrupted by user")

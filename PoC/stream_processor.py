@@ -60,7 +60,6 @@ class SyncClock:
 # Add parent directory for tracking/detection imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools import apply_blur, apply_mosaic, apply_black_box
 from tools.adaptive_fps import AdaptiveFPSController
 
 
@@ -159,8 +158,11 @@ class MultiStreamProcessor:
         self._states: Dict[str, StreamState] = {}
         self._stats = StatsAggregator()
         self._executor = ThreadPoolExecutor(max_workers=max(len(config.streams) * 3, 8))
-        # Limit concurrent GPU inference to prevent CUDA OOM (2 = overlap read+infer)
-        self._gpu_sem = threading.Semaphore(2)
+        # Limit concurrent GPU inference to prevent CUDA OOM.
+        # Configurable via config.gpu.inference_concurrency (default 2, A100/TRT 권장 4~6).
+        gpu_concurrency = max(1, int(getattr(config.gpu, "inference_concurrency", 2)))
+        self._gpu_sem = threading.Semaphore(gpu_concurrency)
+        logger.info(f"GPU inference concurrency = {gpu_concurrency}")
         self._stream_tasks: Dict[str, asyncio.Task] = {}
         self._stats_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -182,9 +184,6 @@ class MultiStreamProcessor:
 
         # Event clip recorders (per-stream, created after capture opens)
         self._clip_recorders: Dict[str, EventClipRecorder] = {}
-
-        # Privacy filter YOLO model (shared across streams)
-        self._privacy_model = None
 
         # Optional metadata broadcaster (mobile overlay)
         self._metadata_sender = None
@@ -237,14 +236,30 @@ class MultiStreamProcessor:
             if gpu.enable_cudnn_benchmark:
                 torch.backends.cudnn.benchmark = True
 
-        # Create one YOLO instance per stream that needs detection
+        # Create one YOLO instance per stream that needs detection.
+        # task="detect" is required for TensorRT .engine files (no task metadata).
         for sid, sc in self.streams.items():
             state = self._states[sid]
             if sc.yolo_classes and state.model is None:
-                state.model = YOLO(model_path)
+                state.model = YOLO(model_path, task="detect")
 
-        # Privacy filter is now handled within _run_tracking (same inference pass).
-        # No separate model needed — person (class 0) is added to detection classes.
+        # Eager-load bathroom classifier once if any stream uses it, so the first
+        # trigger frame doesn't stall for 1-2s loading YOLO. The classifier is a
+        # module-level singleton (detection.bathroom._cls_model), so prime it now.
+        bathroom_paths = {sc.bathroom_cls_model for sc in self.streams.values() if sc.task_bathroom}
+        if bathroom_paths:
+            from detection.bathroom import _load_cls_model
+            for path in bathroom_paths:
+                try:
+                    _load_cls_model(path)
+                    logger.info(f"Bathroom classifier pre-loaded: {path}")
+                    break  # module-level global only holds one model
+                except Exception as e:
+                    logger.warning(f"Bathroom classifier pre-load failed ({path}): {e}")
+
+        # Privacy filter is handled within _run_tracking (class 0 added to detection
+        # classes in the same inference pass). Person bboxes are pushed via metadata
+        # for client-side overlay; no server-side drawing.
 
     # ------------------------------------------------------------------
     # Stream lifecycle
@@ -601,14 +616,8 @@ class MultiStreamProcessor:
                                 boxes = self._interpolate_boxes(state)
                                 track_ids = state.last_track_ids
                                 bowl_boxes = state.last_bowl_boxes
-                                if sc.privacy and state.last_person_boxes:
-                                    for px1, py1, px2, py2 in state.last_person_boxes:
-                                        if sc.privacy_method == "mosaic":
-                                            frame = apply_mosaic(frame, px1, py1, px2, py2)
-                                        elif sc.privacy_method == "black":
-                                            frame = apply_black_box(frame, px1, py1, px2, py2)
-                                        else:
-                                            frame = apply_blur(frame, px1, py1, px2, py2)
+                                # Privacy is metadata-only — person_boxes stay in state.last_person_boxes
+                                # and are appended to the metadata push in _run_behavior_detection.
 
                         # 2) 처리시간 기반 skip (enable_adaptive_skip) — 처리가 늦을 때 프레임 skip
                         if run_yolo and self.config.processing.enable_adaptive_skip and state.skip_counter > 0:
@@ -618,15 +627,7 @@ class MultiStreamProcessor:
                             track_ids = state.last_track_ids
                             bowl_boxes = state.last_bowl_boxes
                             run_yolo = False
-                            # Apply cached privacy filter on skip frames
-                            if sc.privacy and state.last_person_boxes:
-                                for px1, py1, px2, py2 in state.last_person_boxes:
-                                    if sc.privacy_method == "mosaic":
-                                        frame = apply_mosaic(frame, px1, py1, px2, py2)
-                                    elif sc.privacy_method == "black":
-                                        frame = apply_black_box(frame, px1, py1, px2, py2)
-                                    else:
-                                        frame = apply_blur(frame, px1, py1, px2, py2)
+                            # Privacy bboxes carried via metadata; no server-side drawing on skip frames.
 
                         if run_yolo:
                             # Record frame gap for velocity normalization
@@ -1150,24 +1151,6 @@ class MultiStreamProcessor:
         logger.warning(f"[capture] Failed after {elapsed:.1f}s: {source}")
         return None
 
-    def _apply_privacy(self, sc: StreamConfig, frame: np.ndarray) -> np.ndarray:
-        """Detect persons (class 0) and apply privacy filter."""
-        results = self._privacy_model(frame, classes=[0], verbose=False)
-        for r in results:
-            for box in r.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                pad = 10
-                x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
-                x2 = min(frame.shape[1], x2 + pad)
-                y2 = min(frame.shape[0], y2 + pad)
-                if sc.privacy_method == "mosaic":
-                    frame = apply_mosaic(frame, x1, y1, x2, y2)
-                elif sc.privacy_method == "black":
-                    frame = apply_black_box(frame, x1, y1, x2, y2)
-                else:
-                    frame = apply_blur(frame, x1, y1, x2, y2)
-        return frame
-
     # ------------------------------------------------------------------
     # YOLO tracking
     # ------------------------------------------------------------------
@@ -1215,7 +1198,7 @@ class MultiStreamProcessor:
                     state.reset_tracker = True
                     state.no_detection_count = 0
                 boxes, track_ids, bowl_boxes = [], [], []
-                # Privacy fallback: blur raw person detections even without tracking
+                # Privacy: collect person bboxes (padded) for metadata; no server-side drawing.
                 if sc.privacy and cls is not None:
                     all_xyxy_np = results[0].boxes.xyxy.cpu().numpy()
                     person_boxes = []
@@ -1227,12 +1210,6 @@ class MultiStreamProcessor:
                             x2 = min(frame.shape[1], x2 + pad)
                             y2 = min(frame.shape[0], y2 + pad)
                             person_boxes.append([x1, y1, x2, y2])
-                            if sc.privacy_method == "mosaic":
-                                frame = apply_mosaic(frame, x1, y1, x2, y2)
-                            elif sc.privacy_method == "black":
-                                frame = apply_black_box(frame, x1, y1, x2, y2)
-                            else:
-                                frame = apply_blur(frame, x1, y1, x2, y2)
                     state.last_person_boxes = person_boxes
                 elif sc.privacy:
                     state.last_person_boxes = []
@@ -1279,7 +1256,8 @@ class MultiStreamProcessor:
                         buf['count'] = 1
                         stable_cls.append(buf['cls'])
 
-                # Privacy filter using stabilized classes
+                # Privacy: collect person bboxes (padded) using stabilized classes.
+                # Metadata push in _run_behavior_detection carries these to mobile clients.
                 if sc.privacy:
                     person_boxes = []
                     for i, c in enumerate(stable_cls):
@@ -1290,12 +1268,6 @@ class MultiStreamProcessor:
                             x2 = min(frame.shape[1], x2 + pad)
                             y2 = min(frame.shape[0], y2 + pad)
                             person_boxes.append([x1, y1, x2, y2])
-                            if sc.privacy_method == "mosaic":
-                                frame = apply_mosaic(frame, x1, y1, x2, y2)
-                            elif sc.privacy_method == "black":
-                                frame = apply_black_box(frame, x1, y1, x2, y2)
-                            else:
-                                frame = apply_blur(frame, x1, y1, x2, y2)
                     state.last_person_boxes = person_boxes
 
                 # Separate pets (class 1) and bowls (class 3) using stabilized classes
@@ -1527,7 +1499,7 @@ class MultiStreamProcessor:
                 state.bathroom_coor, state.bathroom_bbox,
                 boxes, behavior_ids, frame,
                 sc.bathroom_cls_model,
-                sc.bathroom_trigger_frames, sc.bathroom_height_drop,
+                sc.bathroom_trigger_frames, sc.bathroom_area_drop,
                 cls_confidence=sc.bathroom_cls_conf,
             )
             bathroom_set = set(bathroom_ids)
@@ -1667,7 +1639,19 @@ class MultiStreamProcessor:
                     "bbox_xywh": [float(bx[0]), float(bx[1]), float(bx[2]), float(bx[3])],
                     "behavior": dog_behavior.get(bid, "normal"),
                 })
-            self._metadata_sender.push_frame(sc.stream_id, ts, meta_tracks)
+            payload = {
+                "type": "frame_metadata",
+                "stream_id": sc.stream_id,
+                "ts": float(ts),
+                "tracks": meta_tracks,
+            }
+            if sc.privacy and state.last_person_boxes:
+                payload["person_boxes"] = [
+                    [int(x1), int(y1), int(x2), int(y2)]
+                    for x1, y1, x2, y2 in state.last_person_boxes
+                ]
+                payload["privacy_method"] = sc.privacy_method
+            self._metadata_sender.push(payload)
 
         return frame
 

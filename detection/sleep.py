@@ -8,7 +8,7 @@ def detect_sleep(
     sleep_bbox,
     sleep_threshold_px_sec,
     sleep_seconds,
-    aspect_ratio_threshold=1.2,
+    aspect_ratio_threshold=0.0,
     area_stability_threshold=0.15,
 ):
     """수면 상태를 감지합니다.
@@ -18,7 +18,8 @@ def detect_sleep(
 
     판단 기준:
     1. 평균 이동 속도(px/sec)가 sleep_threshold_px_sec 이하 (거의 움직이지 않음)
-    2. bbox의 장축/단축 비율(aspect ratio)이 aspect_ratio_threshold 이상 (누운 자세)
+    2. (선택) bbox의 장축/단축 비율(aspect ratio)이 aspect_ratio_threshold 이상 (누운 자세)
+       — 카메라 각도에 따라 같은 자세도 비율이 크게 달라지므로 기본값 0(비활성).
     3. bbox 면적 변화율(coefficient of variation)이 area_stability_threshold 이하
 
     Args:
@@ -30,6 +31,7 @@ def detect_sleep(
         sleep_seconds: time window in seconds.
             Convert from frames: sleep_frames / target_fps.
         aspect_ratio_threshold: bbox long/short side ratio threshold.
+            Set to 0 to disable (recommended when camera angles vary).
         area_stability_threshold: bbox area coefficient-of-variation threshold.
 
     Returns:
@@ -67,19 +69,20 @@ def detect_sleep(
         if avg_speed >= sleep_threshold_px_sec:
             continue
 
-        # 2. bbox aspect ratio check (누운 자세)
+        # 2. (optional) bbox aspect ratio check — angle-dependent, opt-in
         widths = np.array([w for _, w, _ in bbox_entries])
         heights = np.array([h for _, _, h in bbox_entries])
         valid = (heights > 0) & (widths > 0)
         if not np.any(valid):
             continue
 
-        long_side = np.maximum(widths[valid], heights[valid])
-        short_side = np.minimum(widths[valid], heights[valid])
-        mean_aspect_ratio = float(np.mean(long_side / short_side))
+        if aspect_ratio_threshold > 0:
+            long_side = np.maximum(widths[valid], heights[valid])
+            short_side = np.minimum(widths[valid], heights[valid])
+            mean_aspect_ratio = float(np.mean(long_side / short_side))
 
-        if mean_aspect_ratio < aspect_ratio_threshold:
-            continue
+            if mean_aspect_ratio < aspect_ratio_threshold:
+                continue
 
         # 3. bbox area stability check
         areas = widths[valid] * heights[valid]

@@ -70,15 +70,16 @@ def detect_eat(
     bowl_boxes,
     iou_threshold=0.3,
     dwell_frames=30,
-    direction_frames=10,
+    direction_frames=0,
 ):
     """
     식사 행동을 감지합니다.
 
-    판단 기준 (3가지 모두 충족):
-    1. 이동 방향이 bowl을 향했음 (코사인 유사도 > 0)
+    판단 기준:
+    1. bowl 기준 겹침 비율이 iou_threshold 이상
     2. bowl 근처에서 dwell_frames 이상 체류
-    3. bowl 기준 겹침 비율이 iou_threshold 이상
+    3. (선택) 이동 방향이 bowl을 향했음 (코사인 유사도 > 0)
+       — 카메라 각도에 따라 2D 이동벡터 의미가 달라지므로 기본값 0(비활성).
 
     Args:
         eat_coor: dict {track_id: deque([(x, y), ...])}
@@ -96,7 +97,8 @@ def detect_eat(
         dwell_frames: int
             bowl 근처 최소 체류 프레임 수
         direction_frames: int
-            이동 방향 판단에 사용할 프레임 수
+            이동 방향 판단에 사용할 프레임 수.
+            0 이면 방향 체크 비활성 (카메라 각도 편차가 있을 때 권장).
 
     Returns:
         eat_id: list - 식사 중으로 판단된 track_id 리스트
@@ -132,20 +134,22 @@ def detect_eat(
             if overlap < iou_threshold:
                 continue
 
-            # 기준 2: bowl 방향으로 이동했었는지
-            bowl_cx = (bowl_xyxy[0] + bowl_xyxy[2]) / 2
-            bowl_cy = (bowl_xyxy[1] + bowl_xyxy[3]) / 2
+            # 기준 2: (선택) bowl 방향으로 이동했었는지
+            # direction_frames=0 이면 방향 체크 비활성 (각도 편차 대응)
+            if direction_frames > 0:
+                bowl_cx = (bowl_xyxy[0] + bowl_xyxy[2]) / 2
+                bowl_cy = (bowl_xyxy[1] + bowl_xyxy[3]) / 2
 
-            if tid in eat_coor and len(eat_coor[tid]) >= direction_frames:
-                moved_toward = check_direction_toward_bowl(
-                    eat_coor[tid], (bowl_cx, bowl_cy), direction_frames
-                )
-            else:
-                # 이력 부족 → 겹침이 충분하면 방향은 통과
-                moved_toward = overlap >= iou_threshold
+                if tid in eat_coor and len(eat_coor[tid]) >= direction_frames:
+                    moved_toward = check_direction_toward_bowl(
+                        eat_coor[tid], (bowl_cx, bowl_cy), direction_frames
+                    )
+                else:
+                    # 이력 부족 → 겹침이 충분하면 방향은 통과
+                    moved_toward = overlap >= iou_threshold
 
-            if not moved_toward:
-                continue
+                if not moved_toward:
+                    continue
 
             # 기준 3: 체류 시간
             eat_near_count[tid] += 1

@@ -18,7 +18,11 @@ Wire format (JSON text frame):
           "behavior": "sleeping"      // one of: normal, fight, escape, sleeping,
                                       //         bathroom, feeding, playing, inactive
         }, ...
-      ]
+      ],
+      "person_boxes": [               // optional — present when privacy=True
+        [x1, y1, x2, y2], ...         // corner-xyxy in source pixels (padded)
+      ],
+      "privacy_method": "blur"        // optional hint: blur | mosaic | black
     }
 
 Usage:

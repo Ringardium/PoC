@@ -4,23 +4,23 @@
     "device_id": 0,
     "memory_fraction": 0.9,
     "half_precision": true,
-    "batch_size": 6,
+    "batch_size": 1,
     "enable_cudnn_benchmark": true,
     "enable_tf32": true
   },
   "processing": {
-    "max_streams": 8,
+    "max_streams": 4,
     "target_resolution": [640, 640],
-    "frame_buffer_size": 60,
-    "inference_timeout": 0.033,
-    "enable_adaptive_skip": true,
+    "frame_buffer_size": 30,
+    "inference_timeout": 0.066,
+    "enable_adaptive_skip": false,
     "max_frame_skip": 2,
-    "min_fps_threshold": 25
+    "min_fps_threshold": 10
   },
   "streams": [
     {
-      "stream_id": "camera_1",
-      "input_source": "rtsp://admin:q1w2e3r4@183.97.69.177:554/streaming/channels/101",
+      "stream_id": "every1",
+      "input_source": "whep://118.41.173.32:2985/live/facility-ddnapet_gmail-every1?vhost=kr",
       "output_path": null,
       "method": "bytetrack",
       "task_fight": true,
@@ -41,14 +41,6 @@
       "sleep_frames": 200,
       "sleep_aspect_ratio": 0.0,
       "sleep_area_stability": 0.15,
-      "eat_iou_threshold": 0.3,
-      "eat_dwell_frames": 30,
-      "eat_direction_frames": 0,
-      "bowl_conf": 0.5,
-      "bathroom_cls_model": "../weights/bathroom_cls.pt",
-      "bathroom_trigger_frames": 30,
-      "bathroom_area_drop": 0.25,
-      "bathroom_cls_conf": 0.5,
       "priority": 1,
       "target_fps": 15,
       "use_reid": false,
@@ -57,6 +49,7 @@
       "reid_global_id": false,
       "reid_freeze_registered": true,
       "label_registered_only": false,
+      "show_track_id": true,
       "yolo_conf": 0.7,
       "yolo_iou": 0.5,
       "yolo_classes": [1],
@@ -66,7 +59,8 @@
       "yolo_persist": true,
       "privacy": false,
       "privacy_method": "blur",
-      "privacy_model": "yolo11n.pt"
+      "privacy_model": "yolo11n.pt",
+      "adaptive_fps_enabled": false
     }
   ],
   "log_level": "INFO",
@@ -77,5 +71,9 @@
   "clip_s3_prefix": "clips/events",
   "clip_pre_seconds": 2.0,
   "clip_post_seconds": 2.0,
-  "cdn_base_url": null
+  "cdn_base_url": null,
+  "metadata_ws_enabled": true,
+  "metadata_ws_host": "0.0.0.0",
+  "metadata_ws_port": 8766,
+  "metadata_ws_path": "/ws/metadata"
 }

@@ -26,15 +26,18 @@ class StreamConfig:
     inert_frames: int = 150
     sleep_threshold: float = 30.0
     sleep_frames: int = 200
-    sleep_aspect_ratio: float = 1.2
+    # aspect ratio: 0 = 비활성 (카메라 각도 편차 대응)
+    sleep_aspect_ratio: float = 0.0
     sleep_area_stability: float = 0.15
     eat_iou_threshold: float = 0.3
     eat_dwell_frames: int = 30
-    eat_direction_frames: int = 10
+    # direction check: 0 = 비활성 (각도 편차 대응). overlap+dwell만 사용
+    eat_direction_frames: int = 0
     bowl_conf: float = 0.5
     bathroom_cls_model: str = "../weights/bathroom_cls.pt"
     bathroom_trigger_frames: int = 30
-    bathroom_height_drop: float = 0.25
+    # bbox 투영 면적 감소율 임계값 (angle-invariant; height 기반에서 교체)
+    bathroom_area_drop: float = 0.25
     bathroom_cls_conf: float = 0.5
     active_threshold: float = 800.0  # ignored (kept for backward compat)
     active_frames: int = 90
@@ -60,10 +63,10 @@ class StreamConfig:
     # Label display
     label_registered_only: bool = False  # True = 등록된 반려동물(pet_profiles)만 라벨 표시
     show_track_id: bool = True           # True = 라벨에 track/global ID 표시, False = 행동명만 표시
-    # Privacy filter
-    privacy: bool = False                # 사람 감지 후 프라이버시 필터 적용
-    privacy_method: str = "blur"         # blur, mosaic, black
-    privacy_model: str = "yolo11n.pt"    # 사람 감지용 YOLO 모델 경로
+    # Privacy filter — server detects person (class 0) and exposes bbox via metadata;
+    # mobile client applies blur/mosaic locally. No server-side drawing.
+    privacy: bool = False                # True = include person bboxes in metadata push
+    privacy_method: str = "blur"         # client-side hint: blur, mosaic, black
     # Adaptive FPS (컨텐츠 기반 YOLO 추론 주기 자동 조절)
     # ProcessingConfig.enable_adaptive_skip(처리시간 기반)과 독립적으로 동작
     adaptive_fps_enabled: bool = False   # False = 항상 매 프레임 YOLO 실행
@@ -94,6 +97,9 @@ class GPUConfig:
     batch_size: int = 6  # Optimal for 6 streams at 30fps
     enable_cudnn_benchmark: bool = True
     enable_tf32: bool = True  # A100 TF32 support
+    # Max concurrent YOLO inferences across streams (protects CUDA OOM).
+    # 2 = conservative (read+infer overlap). A100/TRT 환경에선 4~6 권장.
+    inference_concurrency: int = 2
 
 
 @dataclass

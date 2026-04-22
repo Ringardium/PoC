@@ -20,6 +20,15 @@ from typing import Optional
 
 import click
 
+# Install uvloop if available (Linux, 2-3x faster asyncio). Safe no-op otherwise.
+_UVLOOP_ACTIVE = False
+try:
+    import uvloop
+    uvloop.install()
+    _UVLOOP_ACTIVE = True
+except ImportError:
+    pass
+
 from config import SystemConfig, StreamConfig, create_sample_config
 from stream_processor import MultiStreamProcessor
 
@@ -203,6 +212,8 @@ def run(
     logger.info(f"Starting {len(sys_config.streams)} streams...")
     logger.info(f"Model: {sys_config.model_path}")
     logger.info(f"Device: cuda (FP16: {sys_config.gpu.half_precision})")
+    if _UVLOOP_ACTIVE:
+        logger.info("uvloop enabled")
     logger.info("Press Ctrl+C to stop")
     print()
 
