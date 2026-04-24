@@ -113,11 +113,11 @@ def detect_bowl_roi(
     video_path,
     model_name="yolov8s-worldv2.pt",
     prompts=None,
-    n_frames=30,
-    duration_sec=10.0,
+    n_frames=60,
+    duration_sec=30.0,
     conf_threshold=0.15,
     iou_threshold=0.5,
-    min_stability=0.15,
+    min_stability=0.1,
     min_confidence=0.2,
     top_k=3,
     dominance_ratio=2.0,
@@ -206,10 +206,10 @@ def draw_debug(samples, candidates, out_path, fallback_scored=None):
               help="YOLO-World 가중치")
 @click.option("--prompts", default=",".join(DEFAULT_PROMPTS),
               help="쉼표 구분 텍스트 프롬프트")
-@click.option("--n-frames", default=30, help="샘플링 프레임 수")
-@click.option("--duration", default=10.0, help="샘플링 구간 (초)")
+@click.option("--n-frames", default=60, help="샘플링 프레임 수")
+@click.option("--duration", default=30.0, help="샘플링 구간 (초)")
 @click.option("--conf", default=0.15, help="검출 confidence 임계값")
-@click.option("--min-stability", default=0.15,
+@click.option("--min-stability", default=0.1,
               help="최종 후보 최소 등장 비율 (0~1)")
 @click.option("--min-confidence", default=0.2,
               help="최종 후보 최소 평균 confidence")
