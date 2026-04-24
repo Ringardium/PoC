@@ -21,7 +21,7 @@ class StreamConfig:
     task_bathroom: bool = False
     task_active: bool = False
     threshold: float = 0.3
-    fight_speed_threshold: float = 5.0
+    fight_speed_threshold: float = 100.0  # px/sec. 두 마리 모두 이 속도 넘어야 fight 카운트
     inert_threshold: float = 1.0   # avg speed (px/frame) — below this = inert
     inert_frames: int = 150
     sleep_threshold: float = 30.0
@@ -34,10 +34,16 @@ class StreamConfig:
     # direction check: 0 = 비활성 (각도 편차 대응). overlap+dwell만 사용
     eat_direction_frames: int = 0
     bowl_conf: float = 0.5
+    # Static bowl ROI JSON 경로 (tools.bowl_roi_detector 출력).
+    # task_eat=True 이고 경로 지정됐으면 파일 없을 시 자동 생성.
+    # None 이면 스트림 ID 기반 기본 경로 사용 (references/bowl_roi_<stream_id>.json).
+    bowl_roi_file: Optional[str] = None
     bathroom_cls_model: str = "../weights/bathroom_cls.pt"
     bathroom_trigger_frames: int = 30
     # bbox 투영 면적 감소율 임계값 (angle-invariant; height 기반에서 교체)
     bathroom_area_drop: float = 0.25
+    # 배변 정지 판정 이동량 임계값 (px). 작을수록 엄격.
+    bathroom_displacement: float = 30.0
     bathroom_cls_conf: float = 0.5
     active_threshold: float = 800.0  # ignored (kept for backward compat)
     active_frames: int = 90

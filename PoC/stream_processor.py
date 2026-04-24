@@ -132,6 +132,8 @@ class StreamState:
         # Adaptive FPS controller (컨텐츠 기반 YOLO skip, config.adaptive_fps_enabled=True 시 초기화)
         self.adaptive_fps_ctrl: Optional[AdaptiveFPSController] = None
         self.last_analysis_time: float = 0.0  # AdaptiveFPSController용 마지막 분석 시각
+        # Static bowl ROI (tools.bowl_roi_detector 에서 1회 검출, 매 프레임 bowl YOLO 추론 skip)
+        self.static_bowl_boxes: Optional["np.ndarray"] = None
 
     def init_behavior_state(self, max_number: int = 500):
         self.close_count = torch.zeros((max_number, max_number))
@@ -393,8 +395,45 @@ class MultiStreamProcessor:
         state.height = int(state.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         state.active = True
 
-        # Auto-add bowl class (3) if eat detection is enabled
-        if sc.task_eat and 3 not in sc.yolo_classes:
+        # ------------------------------------------------------------------
+        # Bowl ROI 로드/자동생성 (task_eat 일 때만)
+        #   - bowl_roi_file 미지정 → references/bowl_roi_<stream_id>.json 기본 경로
+        #   - 파일 없으면 tools.bowl_roi_detector 로 자동 검출
+        #   - 성공 시 state.static_bowl_boxes 에 저장, 매 프레임 bowl YOLO 추론 skip
+        #   - 실패 시 fallback: yolo_classes 에 3 추가해 per-frame 검출
+        # ------------------------------------------------------------------
+        if sc.task_eat:
+            import json as _json
+            import os as _os
+
+            _roi_path = sc.bowl_roi_file or f"references/bowl_roi_{sc.stream_id}.json"
+
+            if not _os.path.exists(_roi_path):
+                logger.info(f"[{sc.stream_id}] Bowl ROI 파일 없음 → 자동 검출 시작")
+                try:
+                    from tools.bowl_roi_detector import ensure_bowl_roi
+                    ensure_bowl_roi(sc.input_source, _roi_path)
+                    logger.info(f"[{sc.stream_id}] Bowl ROI 자동 생성 완료: {_roi_path}")
+                except Exception as e:
+                    logger.warning(f"[{sc.stream_id}] Bowl ROI 자동 검출 실패: {e} → per-frame YOLO fallback")
+
+            if _os.path.exists(_roi_path):
+                try:
+                    with open(_roi_path, "r", encoding="utf-8") as _f:
+                        _payload = _json.load(_f)
+                    _cands = _payload.get("candidates") or []
+                    if _cands:
+                        state.static_bowl_boxes = np.array(
+                            [c["roi_xyxy"] for c in _cands], dtype=np.float32
+                        )
+                        logger.info(
+                            f"[{sc.stream_id}] Static bowl ROI {len(state.static_bowl_boxes)}개 로드: {_roi_path}"
+                        )
+                except Exception as e:
+                    logger.warning(f"[{sc.stream_id}] Bowl ROI 로드 실패: {e}")
+
+        # bowl class (3) 자동 추가 — static ROI 없을 때만 (fallback)
+        if sc.task_eat and state.static_bowl_boxes is None and 3 not in sc.yolo_classes:
             sc.yolo_classes = list(sc.yolo_classes) + [3]
 
         needs_yolo = bool(sc.yolo_classes) and state.model is not None
@@ -1294,7 +1333,10 @@ class MultiStreamProcessor:
                 # Don't use results[0].plot() — we draw our own bbox + labels
         elif sc.method == "deepsort":
             from tracking import track_with_deepsort  # noqa: root-level module
-            boxes, track_ids, frame = track_with_deepsort(state.model, state.tracker, frame)
+            boxes, track_ids, frame = track_with_deepsort(
+                state.model, state.tracker, frame,
+                conf=sc.yolo_conf, iou=sc.yolo_iou,
+            )
             bowl_boxes = []
         else:
             boxes, track_ids, bowl_boxes = [], [], []
@@ -1424,10 +1466,13 @@ class MultiStreamProcessor:
         # Fight detection
         fight_set = set()
         if sc.task_fight and state.close_count is not None:
+            # detect_fight 는 초 단위 누산 → frames 을 target_fps 로 나눠서 seconds 로 변환
+            _fps = sc.target_fps if sc.target_fps > 0 else 30
             fight_indices, state.close_count, state.far_count = detect_fight(
                 x_arr, y_arr, track_ids, state.close_count, state.far_count,
-                sc.threshold, sc.reset_frames, sc.flag_frames,
+                sc.threshold, sc.reset_frames / _fps, sc.flag_frames / _fps,
                 last_w, last_h,
+                dt=1.0 / _fps,
                 speeds=speeds,
                 fight_speed_threshold_px_sec=sc.fight_speed_threshold,
             )
@@ -1500,6 +1545,7 @@ class MultiStreamProcessor:
                 boxes, behavior_ids, frame,
                 sc.bathroom_cls_model,
                 sc.bathroom_trigger_frames, sc.bathroom_area_drop,
+                displacement_threshold=sc.bathroom_displacement,
                 cls_confidence=sc.bathroom_cls_conf,
             )
             bathroom_set = set(bathroom_ids)
@@ -1517,10 +1563,17 @@ class MultiStreamProcessor:
         # Eat detection
         eat_set = set()
         if sc.task_eat:
+            # Static ROI 있으면 우선 사용 (매 프레임 bowl 추론 skip)
+            if state.static_bowl_boxes is not None:
+                _bowls_for_eat = state.static_bowl_boxes
+            elif bowl_boxes is not None and len(bowl_boxes) > 0:
+                _bowls_for_eat = bowl_boxes
+            else:
+                _bowls_for_eat = []
             eat_ids = detect_eat(
                 state.eat_coor, state.eat_near_count,
                 boxes, behavior_ids,
-                bowl_boxes if (bowl_boxes is not None and len(bowl_boxes) > 0) else [],
+                _bowls_for_eat,
                 sc.eat_iou_threshold, sc.eat_dwell_frames, sc.eat_direction_frames,
             )
             eat_set = set(eat_ids)

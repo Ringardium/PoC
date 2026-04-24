@@ -7,8 +7,6 @@ import numpy as np
 import supervision as sv
 import torch
 from PIL import Image, ImageDraw, ImageFont
-# pilmoji 대신 Windows Segoe UI Emoji 폰트 사용
-PILMOJI_AVAILABLE = False  # pilmoji 비활성화
 from ultralytics import YOLO
 
 from deep_sort import nn_matching
@@ -30,16 +28,9 @@ from tools import apply_blur, apply_mosaic, apply_black_box
 
 # --- Supervision bbox 설정 ---
 CONFIG_USE_SUPERVISION = False                   # supervision 사용 여부 (Pillow 사용 시 False)
-CONFIG_SV_BOX_COLOR = (0, 255, 0)               # 박스 색상 (RGB) - 초록
 CONFIG_SV_BOX_THICKNESS = 2                      # 박스 두께
 CONFIG_SV_BOX_STYLE = "normal"                   # "normal", "round", "corner"
-CONFIG_SV_LABEL_SCALE = 0.5                      # 라벨 텍스트 크기
-CONFIG_SV_LABEL_COLOR = (255, 255, 255)         # 라벨 텍스트 색상 (RGB) - 흰색
-CONFIG_SV_LABEL_BG_COLOR = (0, 255, 0)          # 라벨 배경 색상 (RGB) - 초록
-CONFIG_SV_LABEL_PADDING = 5                      # 라벨 패딩
-CONFIG_SV_LABEL_POSITION = "TOP_LEFT"            # "TOP_LEFT", "TOP_RIGHT", "TOP_CENTER", "BOTTOM_LEFT", "BOTTOM_RIGHT", "BOTTOM_CENTER"
 CONFIG_SV_LABEL_FORMAT = "ID: {id}"              # 라벨 포맷 ({id}, {conf} 사용 가능)
-CONFIG_SV_SHOW_TRACE = False                     # 궤적 표시 여부
 CONFIG_SV_SHOW_CENTER = True                     # 중심점 표시 여부
 
 # --- Pillow 텍스트 설정 (한글/이모티콘 지원) ---
@@ -65,7 +56,6 @@ CONFIG_NORMAL_BOX_COLOR = (0, 255, 0)            # 정상 상태 bbox 색상 (RG
 CONFIG_FIGHT_BOX_COLOR = (255, 0, 0)             # 싸움 감지 bbox 색상 (RGB) - 빨강
 CONFIG_ESCAPE_BOX_COLOR = (255, 255, 0)          # 이탈 감지 bbox 색상 (RGB) - 노랑
 CONFIG_INERT_BOX_COLOR = (0, 0, 255)             # 무기력 감지 bbox 색상 (RGB) - 파랑
-CONFIG_PLAY_BOX_COLOR = (255, 165, 0)            # 활동 감지 bbox 색상 (RGB) - 주황
 CONFIG_SLEEP_BOX_COLOR = (128, 0, 128)           # 수면 감지 bbox 색상 (RGB) - 보라
 CONFIG_EAT_BOX_COLOR = (255, 105, 180)           # 식사 감지 bbox 색상 (RGB) - 분홍
 CONFIG_BATHROOM_BOX_COLOR = (0, 191, 255)        # 배변 감지 bbox 색상 (RGB) - 하늘
@@ -74,8 +64,6 @@ CONFIG_BATHROOM_BOX_COLOR = (0, 191, 255)        # 배변 감지 bbox 색상 (RG
 CONFIG_FIGHT_EMOJI = "🥊"                        # 싸움 감지 시 ID 옆에 표시할 이모지
 CONFIG_ESCAPE_EMOJI = "⚠️"                       # 이탈 감지 시 ID 옆에 표시할 이모지
 CONFIG_INERT_EMOJI = "❄️"                        # 무기력 감지 시 ID 옆에 표시할 이모지
-CONFIG_NORMAL_EMOJI = ""                         # 정상 상태 이모지 (빈 문자열이면 표시 안 함)
-CONFIG_PLAY_EMOJI = "🎾"                         # 활동 감지 시 이모지
 CONFIG_SLEEP_EMOJI = "😴"                        # 수면 감지 시 이모지
 CONFIG_EAT_EMOJI = "🍽️"                         # 식사 감지 시 이모지
 CONFIG_BATHROOM_EMOJI = "🚽"                     # 배변 감지 시 이모지
@@ -388,12 +376,9 @@ def create_supervision_annotators(
     label_text_scale: float = 0.5,  # 라벨 텍스트 크기
     label_text_thickness: int = 1,  # 라벨 텍스트 두께
     label_text_padding: int = 5,  # 라벨 패딩
-    label_position=None,  # 라벨 위치
     # === 추가 Annotator 옵션 ===
     use_round_box: bool = False,  # 둥근 박스 사용 여부
-    round_box_radius: int = 10,  # 둥근 박스 반경
     use_corner_box: bool = False,  # 코너만 그리는 박스 사용 여부
-    corner_length: int = 15,  # 코너 길이
 ) -> dict:
     """
     Supervision annotator들을 생성합니다.
@@ -486,7 +471,6 @@ def annotate_frame_with_supervision(
     confidences: list = None,
     annotators: dict = None,
     label_format: str = "ID: {id}",  # "{id}", "{conf}", "{id} ({conf:.2f})" 등
-    class_names: dict = None,  # {class_id: "name"} 매핑
 ) -> np.ndarray:
     """
     Supervision을 사용하여 프레임에 박스와 라벨을 그립니다.
@@ -498,7 +482,6 @@ def annotate_frame_with_supervision(
         confidences: 신뢰도 리스트 (옵션)
         annotators: create_supervision_annotators()에서 생성한 annotator dict
         label_format: 라벨 포맷 문자열
-        class_names: 클래스 이름 매핑
 
     Returns:
         어노테이션된 프레임
@@ -552,6 +535,10 @@ def annotate_frame_with_supervision(
 @click.option("--task-eat", is_flag=True)
 @click.option("--task-bathroom", is_flag=True)
 @click.option("--threshold", default=0.1)
+@click.option("--model-conf", default=0.7, help="모델 detection confidence 임계값 (트래커 공통)")
+@click.option("--model-iou", default=0.5, help="모델 NMS IoU 임계값 (트래커 공통)")
+@click.option("--fight-speed-threshold", default=100.0,
+              help="싸움 판정 최소 속도 (px/sec). 두 마리 모두 이 속도 넘어야 근접을 fight 로 카운트 (speeds 인자 주입 시에만 적용).")
 @click.option("--inert-threshold", default=50)
 @click.option("--inert-frames", default=100)
 @click.option("--sleep-threshold", default=30)
@@ -567,6 +554,8 @@ def annotate_frame_with_supervision(
 @click.option("--bathroom-cls-model", default="weights/bathroom_cls.pt")
 @click.option("--bathroom-trigger-frames", default=30)
 @click.option("--bathroom-area-drop", default=0.25, help="bbox 투영 면적 감소율 임계값 (angle-invariant)")
+@click.option("--bathroom-displacement", default=30.0,
+              help="배변 정지 판정 이동량 임계값. 작을수록 엄격(완전히 가만히 있어야 트리거)")
 @click.option("--bathroom-cls-conf", default=0.5)
 @click.option("--reset-frames", default=60)
 @click.option("--flag-frames", default=4)
@@ -577,7 +566,7 @@ def annotate_frame_with_supervision(
 @click.option("--reid-global-id", is_flag=True, help="ReID 글로벌 ID 할당 활성화 (full pipeline)")
 @click.option("--privacy", is_flag=True, help="사람 감지 후 프라이버시 필터 적용")
 @click.option("--privacy-method", type=click.Choice(["blur", "mosaic", "black"]), default="blur", help="프라이버시 필터 방식")
-@click.option("--privacy-model", default="yolo11n.pt", help="사람 감지용 YOLO 모델 경로")
+@click.option("--privacy-conf", default=0.5, help="프라이버시용 사람 감지 confidence 임계값")
 def main(
     model,
     method,
@@ -590,6 +579,9 @@ def main(
     task_eat,
     task_bathroom,
     threshold,
+    model_conf,
+    model_iou,
+    fight_speed_threshold,
     inert_threshold,
     inert_frames,
     sleep_threshold,
@@ -604,6 +596,7 @@ def main(
     bathroom_cls_model,
     bathroom_trigger_frames,
     bathroom_area_drop,
+    bathroom_displacement,
     bathroom_cls_conf,
     reset_frames,
     flag_frames,
@@ -614,30 +607,53 @@ def main(
     reid_global_id,
     privacy,
     privacy_method,
-    privacy_model,
+    privacy_conf,
 ):
     model = YOLO(model)
     cap = cv2.VideoCapture(input)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
 
     # ========================================================================
-    # Static bowl ROI 로드 (--bowl-roi-file 지정 시 프레임별 bowl 추론 skip)
+    # Static bowl ROI 로드/자동생성 (--task-eat 일 때만)
+    #   - ROI 파일 미지정 → 입력 영상명 기반 기본 경로 사용
+    #   - 파일 없으면 bowl_roi_detector 를 자동 실행해 생성
+    #   - 실패 시 per-frame YOLO bowl 추론으로 fallback
     # ========================================================================
     static_bowl_boxes = None
-    if bowl_roi_file:
+    if task_eat:
         import json as _json
-        with open(bowl_roi_file, "r", encoding="utf-8") as _f:
-            _roi_payload = _json.load(_f)
-        _cands = _roi_payload.get("candidates") or []
-        if not _cands:
-            print(f"[WARN] {bowl_roi_file} 에 후보가 없습니다. per-frame YOLO bowl 추론으로 fallback.")
-        else:
-            static_bowl_boxes = np.array(
-                [c["roi_xyxy"] for c in _cands], dtype=np.float32
-            )
-            _amb = "" if _roi_payload.get("unambiguous", True) else " (ambiguous)"
-            print(f"[INFO] Static bowl ROI {len(static_bowl_boxes)}개 로드{_amb}: "
-                  f"{bowl_roi_file}")
+        import os as _os
+        from pathlib import Path as _Path
+
+        if not bowl_roi_file:
+            _stem = _Path(input).stem or "default"
+            bowl_roi_file = f"references/bowl_roi_{_stem}.json"
+            print(f"[INFO] --bowl-roi-file 미지정 → 기본 경로 사용: {bowl_roi_file}")
+
+        if not _os.path.exists(bowl_roi_file):
+            print(f"[INFO] Bowl ROI 파일 없음 → 자동 검출 시작 (소스: {input})")
+            try:
+                from tools.bowl_roi_detector import ensure_bowl_roi
+                ensure_bowl_roi(input, bowl_roi_file)
+                print(f"[INFO] Bowl ROI 자동 생성 완료: {bowl_roi_file}")
+            except Exception as _e:
+                print(f"[WARN] Bowl ROI 자동 검출 실패: {_e}")
+                print(f"[WARN] per-frame YOLO bowl 추론으로 fallback 합니다.")
+                bowl_roi_file = None
+
+        if bowl_roi_file and _os.path.exists(bowl_roi_file):
+            with open(bowl_roi_file, "r", encoding="utf-8") as _f:
+                _roi_payload = _json.load(_f)
+            _cands = _roi_payload.get("candidates") or []
+            if not _cands:
+                print(f"[WARN] {bowl_roi_file} 에 후보가 없습니다. per-frame YOLO bowl 추론으로 fallback.")
+            else:
+                static_bowl_boxes = np.array(
+                    [c["roi_xyxy"] for c in _cands], dtype=np.float32
+                )
+                _amb = "" if _roi_payload.get("unambiguous", True) else " (ambiguous)"
+                print(f"[INFO] Static bowl ROI {len(static_bowl_boxes)}개 로드{_amb}: "
+                      f"{bowl_roi_file}")
 
     max_cosine_distance = 0.5
     nn_budget = None
@@ -662,12 +678,10 @@ def main(
         print(f"[INFO] ReID 활성화 - mode: {mode}, method: {reid_method}, threshold: {reid_threshold}")
 
     # ========================================================================
-    # 프라이버시 필터 초기화
+    # 프라이버시 필터 초기화 (메인 model 재사용, class 0 = person)
     # ========================================================================
-    privacy_yolo = None
     if privacy:
-        privacy_yolo = YOLO(privacy_model)
-        print(f"[INFO] 프라이버시 필터 활성화 - method: {privacy_method}, model: {privacy_model}")
+        print(f"[INFO] 프라이버시 필터 활성화 - method: {privacy_method}")
 
     # ========================================================================
     # Supervision Annotator 설정 (하드코딩 CONFIG 사용)
@@ -718,8 +732,9 @@ def main(
             frame_cnt += 1
 
             # 프라이버시 필터 적용 (사람 감지 → 블러/모자이크/블랙박스)
-            if privacy_yolo is not None:
-                person_results = privacy_yolo(frame, conf=0.5, classes=[0], verbose=False)
+            # 메인 model 재사용 (class 0 = person)
+            if privacy:
+                person_results = model.predict(frame, conf=privacy_conf, classes=[0], verbose=False)
                 if len(person_results[0].boxes) > 0:
                     person_boxes = person_results[0].boxes.xyxy.cpu().numpy().astype(int)
                     for pb in person_boxes:
@@ -734,11 +749,17 @@ def main(
                             frame = apply_black_box(frame, px1, py1, px2, py2)
 
             if method == "bytetrack":
-                boxes, track_ids, frame = track_with_bytetrack(model, frame)
+                boxes, track_ids, frame = track_with_bytetrack(
+                    model, frame, conf=model_conf, iou=model_iou
+                )
             elif method == "botsort":
-                boxes, track_ids, frame = track_with_botsort(model, frame)
+                boxes, track_ids, frame = track_with_botsort(
+                    model, frame, conf=model_conf, iou=model_iou
+                )
             elif method == "deepsort":
-                boxes, track_ids, frame = track_with_deepsort(model, tracker, frame)
+                boxes, track_ids, frame = track_with_deepsort(
+                    model, tracker, frame, conf=model_conf, iou=model_iou
+                )
             else:
                 raise NotImplementedError
 
@@ -797,17 +818,21 @@ def main(
 
             # detect fight
             if task_fight:
-                fight_indices = detect_fight(
+                # detect_fight 는 초 단위로 누산 → frames 을 seconds 로 변환
+                _fps = fps if fps > 0 else 30
+                fight_indices, close_count, far_count = detect_fight(
                     x_centers,
                     y_centers,
                     track_ids,
                     close_count,
                     far_count,
                     threshold,
-                    reset_frames,
-                    flag_frames,
+                    reset_frames / _fps,
+                    flag_frames / _fps,
                     int(width),
                     int(height),
+                    dt=1.0 / _fps,
+                    fight_speed_threshold_px_sec=fight_speed_threshold,
                 )
 
                 # 싸움 감지된 ID 상태 업데이트
@@ -886,7 +911,7 @@ def main(
                 else:
                     # Legacy 모드: 매 프레임 class 3 검출
                     bowl_results = model.predict(
-                        frame, conf=bowl_conf, iou=0.5, classes=[3], verbose=False
+                        frame, conf=bowl_conf, iou=model_iou, classes=[3], verbose=False
                     )
                     bowl_boxes = []
                     if len(bowl_results[0].boxes) > 0:
@@ -922,6 +947,7 @@ def main(
                     bathroom_cls_model,
                     bathroom_trigger_frames,
                     bathroom_area_drop,
+                    displacement_threshold=bathroom_displacement,
                     cls_confidence=bathroom_cls_conf,
                 )
 

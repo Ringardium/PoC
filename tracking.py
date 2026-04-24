@@ -24,7 +24,8 @@ def save_video(f, frames, fps):
     return f
 
 
-def track_with_bytetrack(model, frame, device=None, bbox_color=(0, 255, 0), bbox_thickness=2,
+def track_with_bytetrack(model, frame, device=None, conf=0.7, iou=0.5,
+                         bbox_color=(0, 255, 0), bbox_thickness=2,
                          font_scale=0.5, font_color=(255, 255, 255), font_thickness=1,
                          show_id=True, show_conf=False, label_format="ID: {id}"):
     """
@@ -49,7 +50,7 @@ def track_with_bytetrack(model, frame, device=None, bbox_color=(0, 255, 0), bbox
         track_ids: List of track IDs
         frame: Annotated frame
     """
-    kwargs = dict(persist=True, conf=0.7, iou=0.5, classes=[1], tracker="bytetrack.yaml")
+    kwargs = dict(persist=True, conf=conf, iou=iou, classes=[1], tracker="bytetrack.yaml")
     if device is not None:
         kwargs["device"] = device
     results = model.track(frame, **kwargs)
@@ -111,7 +112,8 @@ def track_with_bytetrack(model, frame, device=None, bbox_color=(0, 255, 0), bbox
     return boxes, track_ids, frame
 
 
-def track_with_botsort(model, frame, device=None, bbox_color=(0, 255, 0), bbox_thickness=2,
+def track_with_botsort(model, frame, device=None, conf=0.7, iou=0.5,
+                       bbox_color=(0, 255, 0), bbox_thickness=2,
                        font_scale=0.5, font_color=(255, 255, 255), font_thickness=1,
                        show_id=True, show_conf=False, label_format="ID: {id}"):
     """
@@ -136,7 +138,7 @@ def track_with_botsort(model, frame, device=None, bbox_color=(0, 255, 0), bbox_t
         track_ids: List of track IDs
         frame: Annotated frame
     """
-    kwargs = dict(persist=True, conf=0.7, iou=0.5, classes=[1], tracker="botsort.yaml")
+    kwargs = dict(persist=True, conf=conf, iou=iou, classes=[1], tracker="botsort.yaml")
     if device is not None:
         kwargs["device"] = device
     results = model.track(frame, **kwargs)
@@ -198,8 +200,8 @@ def track_with_botsort(model, frame, device=None, bbox_color=(0, 255, 0), bbox_t
     return boxes, track_ids, frame
 
 
-def track_with_deepsort(model, tracker, frame):
-    results = model(frame, conf=0.7, iou=0.5, classes=[1])
+def track_with_deepsort(model, tracker, frame, conf=0.7, iou=0.5):
+    results = model(frame, conf=conf, iou=iou, classes=[1])
 
     boxes = results[0].boxes
 

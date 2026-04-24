@@ -167,6 +167,41 @@ def detect_bowl_roi(
     }, samples
 
 
+def ensure_bowl_roi(video_path, output_path, force=False, **kwargs):
+    """output_path 에 ROI JSON 이 없거나 force=True 면 생성, 있으면 그대로 경로 반환.
+
+    main.py 등에서 "eat 시작 시 ROI 없으면 자동 검출" 용도로 사용.
+    **kwargs 는 detect_bowl_roi 에 그대로 전달됨.
+    """
+    if os.path.exists(output_path) and not force:
+        return output_path
+
+    result, _ = detect_bowl_roi(video_path=video_path, **kwargs)
+
+    payload = {
+        "source": os.path.abspath(video_path),
+        "detected_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "model": kwargs.get("model_name", "yolov8s-worldv2.pt"),
+        "prompts": result["prompts"],
+        "frame_shape": result["frame_shape"],
+        "n_sampled": result["n_sampled"],
+        "unambiguous": result["unambiguous"],
+        "candidates": result["candidates"],
+    }
+
+    if not result["candidates"]:
+        raise RuntimeError(
+            f"bowl ROI 후보가 검출되지 않았습니다 (video={video_path}). "
+            f"threshold 조정 또는 다른 영상 필요."
+        )
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    return output_path
+
+
 def draw_debug(samples, candidates, out_path, fallback_scored=None):
     """첫 샘플 프레임에 후보 ROI 를 그려서 저장.
 
