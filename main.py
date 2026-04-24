@@ -562,6 +562,8 @@ def annotate_frame_with_supervision(
 @click.option("--eat-dwell-frames", default=30)
 @click.option("--eat-direction-frames", default=0, help="0 = 비활성 (각도 편차 대응). overlap+dwell만 사용")
 @click.option("--bowl-conf", default=0.5)
+@click.option("--bowl-roi-file", default=None,
+              help="bowl_roi_detector 로 생성한 JSON 경로. 지정 시 매 프레임 bowl YOLO 추론을 skip 하고 static ROI 를 사용.")
 @click.option("--bathroom-cls-model", default="weights/bathroom_cls.pt")
 @click.option("--bathroom-trigger-frames", default=30)
 @click.option("--bathroom-area-drop", default=0.25, help="bbox 투영 면적 감소율 임계값 (angle-invariant)")
@@ -598,6 +600,7 @@ def main(
     eat_dwell_frames,
     eat_direction_frames,
     bowl_conf,
+    bowl_roi_file,
     bathroom_cls_model,
     bathroom_trigger_frames,
     bathroom_area_drop,
@@ -616,6 +619,25 @@ def main(
     model = YOLO(model)
     cap = cv2.VideoCapture(input)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
+
+    # ========================================================================
+    # Static bowl ROI 로드 (--bowl-roi-file 지정 시 프레임별 bowl 추론 skip)
+    # ========================================================================
+    static_bowl_boxes = None
+    if bowl_roi_file:
+        import json as _json
+        with open(bowl_roi_file, "r", encoding="utf-8") as _f:
+            _roi_payload = _json.load(_f)
+        _cands = _roi_payload.get("candidates") or []
+        if not _cands:
+            print(f"[WARN] {bowl_roi_file} 에 후보가 없습니다. per-frame YOLO bowl 추론으로 fallback.")
+        else:
+            static_bowl_boxes = np.array(
+                [c["roi_xyxy"] for c in _cands], dtype=np.float32
+            )
+            _amb = "" if _roi_payload.get("unambiguous", True) else " (ambiguous)"
+            print(f"[INFO] Static bowl ROI {len(static_bowl_boxes)}개 로드{_amb}: "
+                  f"{bowl_roi_file}")
 
     max_cosine_distance = 0.5
     nn_budget = None
@@ -858,13 +880,17 @@ def main(
 
             # detect eat
             if task_eat:
-                # bowl 감지 (class 3, tracking 불필요)
-                bowl_results = model.predict(
-                    frame, conf=bowl_conf, iou=0.5, classes=[3], verbose=False
-                )
-                bowl_boxes = []
-                if len(bowl_results[0].boxes) > 0:
-                    bowl_boxes = bowl_results[0].boxes.xyxy.cpu().numpy()
+                if static_bowl_boxes is not None:
+                    # Static ROI 모드: 프레임별 YOLO bowl 추론 skip
+                    bowl_boxes = static_bowl_boxes
+                else:
+                    # Legacy 모드: 매 프레임 class 3 검출
+                    bowl_results = model.predict(
+                        frame, conf=bowl_conf, iou=0.5, classes=[3], verbose=False
+                    )
+                    bowl_boxes = []
+                    if len(bowl_results[0].boxes) > 0:
+                        bowl_boxes = bowl_results[0].boxes.xyxy.cpu().numpy()
 
                 eat_indices = detect_eat(
                     eat_coor,

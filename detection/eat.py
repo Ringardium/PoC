@@ -91,7 +91,9 @@ def detect_eat(
         track_ids: list of int
             현재 프레임의 track ID
         bowl_boxes: numpy array of shape (N, 4) in xyxy format
-            현재 프레임의 bowl bbox
+            현재 프레임의 bowl bbox.
+            main.py 의 --bowl-roi-file 로 static ROI 를 주입한 경우,
+            여기엔 프레임별 YOLO 검출 대신 고정 ROI 배열이 전달됩니다 (동일 포맷).
         iou_threshold: float
             bowl 기준 겹침 비율 임계값
         dwell_frames: int
