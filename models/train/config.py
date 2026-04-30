@@ -1,6 +1,7 @@
 """Configuration dataclasses for Pet Tracker training module."""
 
-from dataclasses import dataclass, field, asdict
+import warnings
+from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
 from typing import List, Optional
 
@@ -183,6 +184,10 @@ class ReIDConfig:
 def load_config(yaml_path: str, config_class: type) -> TrainConfig:
     """Load configuration from a YAML file.
 
+    Unknown YAML keys are dropped with a warning instead of raising —
+    config schemas evolve over time and old yaml files shouldn't crash a run.
+    Typos are still surfaced (just not fatally).
+
     Args:
         yaml_path: Path to YAML config file.
         config_class: Target dataclass type (FinetuneConfig, ExpandConfig, DistillConfig).
@@ -200,6 +205,20 @@ def load_config(yaml_path: str, config_class: type) -> TrainConfig:
     # Handle nested configs (only for TrainConfig subclasses that use LossConfig/AugmentConfig)
     loss_val = raw.pop("loss", None)
     augment_dict = raw.pop("augment", None)
+
+    # Drop unknown keys before constructing the dataclass — emit one warning
+    # listing them so the user can spot typos without the run dying.
+    known_fields = {f.name for f in fields(config_class)}
+    unknown = [k for k in raw if k not in known_fields]
+    if unknown:
+        valid_hint = ", ".join(sorted(known_fields))
+        warnings.warn(
+            f"[load_config] {yaml_path}: ignoring unknown keys {unknown} for "
+            f"{config_class.__name__}. Valid keys: {valid_hint}",
+            stacklevel=2,
+        )
+        for k in unknown:
+            raw.pop(k, None)
 
     config = config_class(**raw)
 
