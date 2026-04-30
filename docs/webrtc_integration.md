@@ -244,15 +244,19 @@ ws://<gpu-host>:8766/ws/metadata
 - `metadata_ws_port`를 다른 값으로 변경
 - 헬스체크: `curl http://<gpu-host>:8766/health` → `{"clients": N, "queued": N}`
 
-### pts/wallclock 드리프트
+### pts/wallclock 드리프트 ✅ RTCP SR 기반 보정 적용됨
 
-- `whep_reader.py`는 첫 프레임의 pts를 `time.time()` 앵커에 고정 → 이후 pts 차이로 wallclock 추론
-- RTP clock (90kHz)이 실제 벽시계와 다르면 drift 발생 (분 단위로 무시 가능 수준)
-- 정밀 동기화 필요 시 RTCP Sender Report 파싱으로 재보정 필요 (현재 미구현)
+- `whep_reader.py` 가 video receiver 의 `_handle_rtcp_packet` 에 hook 을 걸어
+  RTCP Sender Report (SR) 의 `(rtp_timestamp, ntp_timestamp)` 쌍을 capture
+- 매 frame 의 wallclock 은 가장 최근 SR anchor 로 변환 → NTP 기준 wallclock 정확도
+- SR 은 SRS 가 ~5초마다 자동 송출하므로 anchor가 주기적으로 refresh → 장시간 drift 0
+- SR 도착 전 (연결 직후 0-5초) 또는 hook 설치 실패 시 → 기존 first-PTS 앵커 fallback
+- `WHEPCapture.has_sr_anchor()` 로 SR 활성 상태 확인 가능
+- `frame_metadata.ts` 가 자동으로 NTP-aligned 됨 → 모바일 측 별도 sync 보정 불필요
 
 ## 향후 개선
 
-- [ ] RTCP SR 기반 pts→wallclock 동기화 (aiortc에서 SR 노출 후)
+- [x] RTCP SR 기반 pts→wallclock 동기화 (whep_reader 에서 receiver hook 으로 구현)
 - [ ] H.265 인그레스 지원 (PyAV HEVC 빌드)
 - [x] 메타데이터 WS에 `client->server` 메시지 추가 (스트림 구독/언구독)
 - [x] stream_id별 메타 필터링 (현재 모든 클라이언트에 모든 스트림 전송)

@@ -98,6 +98,13 @@ class WHEPCapture:
         self._first_pts_wallclock: Optional[float] = None
         self._last_frame_wallclock: Optional[float] = None
 
+        # Latest RTCP Sender Report anchor — (rtp_timestamp, ntp_unix_seconds).
+        # Populated by hook installed on the video RTCRtpReceiver's
+        # _handle_rtcp_packet. SR is sent every ~5s by SRS so this drifts
+        # within an SR interval but resyncs each report → max drift ~few ms
+        # vs source wallclock (vs unbounded drift in first-PTS anchor mode).
+        self._sr_anchor: Optional[Tuple[int, float]] = None
+
         self._opened = False
 
     # ------------------------------------------------------------------
@@ -154,6 +161,40 @@ class WHEPCapture:
         """Unix timestamp of the last frame (source-aligned via RTP pts)."""
         return self._last_frame_wallclock
 
+    def _compute_wallclock(self, pts: int, time_base, now: float) -> float:
+        """Convert RTP pts → unix wallclock.
+
+        Uses RTCP SR anchor when available (NTP-aligned, drift-resistant).
+        Otherwise falls back to the first-frame `time.time()` anchor.
+
+        SR anchor format: ``(rtp_timestamp_at_sr, ntp_unix_seconds_at_sr)``.
+        Frame wallclock = ntp_unix + (frame.pts - rtp_at_sr) * time_base.
+
+        ``time_base`` is a fractions.Fraction (e.g. 1/90000 for video).
+        """
+        if self._sr_anchor is not None and time_base is not None:
+            try:
+                rtp_anchor, ntp_anchor = self._sr_anchor
+                # RTP timestamps wrap at 2^32 — handle wrap by treating diff
+                # as signed 32-bit (positive small = forward, negative = wrap)
+                diff = (pts - rtp_anchor) & 0xFFFFFFFF
+                if diff & 0x80000000:
+                    diff -= 0x100000000
+                pts_sec = float(diff * time_base)
+                return ntp_anchor + pts_sec
+            except Exception:
+                pass
+        # Fallback: first-frame anchor (legacy behavior)
+        try:
+            pts_sec = float((pts - (self._first_pts or 0)) * (self._first_pts_time_base or 0))
+        except Exception:
+            pts_sec = 0.0
+        return (self._first_pts_wallclock or now) + pts_sec
+
+    def has_sr_anchor(self) -> bool:
+        """True once at least one RTCP Sender Report has been received."""
+        return self._sr_anchor is not None
+
     # ------------------------------------------------------------------
     # Background asyncio loop
     # ------------------------------------------------------------------
@@ -192,6 +233,13 @@ class WHEPCapture:
         answer_sdp = await self._signal(aiohttp)
         await self._pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
 
+        # Install RTCP Sender Report hook on the video receiver.
+        # Failure is non-fatal — falls back to first-PTS anchor.
+        try:
+            self._install_rtcp_sr_hook()
+        except Exception as e:
+            logger.warning(f"WHEP RTCP SR hook install failed (will use first-PTS anchor): {e}")
+
         # Sleep until release(); polling avoids needing a separate async Event
         while not self._closed.is_set():
             await asyncio.sleep(0.2)
@@ -200,6 +248,56 @@ class WHEPCapture:
             await self._pc.close()
         except Exception:
             pass
+
+    def _install_rtcp_sr_hook(self):
+        """Wrap the video receiver's _handle_rtcp_packet to capture Sender Reports.
+
+        aiortc consumes RTCP SR internally for stats but doesn't expose the
+        rtp↔ntp anchor publicly. We monkey-patch the bound method on the
+        receiver instance — this is a private API path but the alternative is
+        forking aiortc.
+        """
+        # Pick the video receiver from the active transceivers
+        video_recv = None
+        for tr in self._pc.getTransceivers():
+            if getattr(tr.receiver, "track", None) and tr.receiver.track.kind == "video":
+                video_recv = tr.receiver
+                break
+            # Fallback: first non-stopped recvonly transceiver
+            if tr.direction in ("recvonly", "sendrecv") and getattr(tr, "kind", None) == "video":
+                video_recv = tr.receiver
+                break
+        if video_recv is None:
+            # Last resort: first receiver from getReceivers
+            recvs = self._pc.getReceivers()
+            for r in recvs:
+                if getattr(r.track, "kind", None) == "video":
+                    video_recv = r
+                    break
+        if video_recv is None:
+            raise RuntimeError("video receiver not found")
+
+        from aiortc.rtcp import RtcpSrPacket  # type: ignore
+
+        original = video_recv._handle_rtcp_packet
+
+        async def _wrapped(packet):
+            try:
+                if isinstance(packet, RtcpSrPacket):
+                    info = packet.sender_info
+                    # NTP timestamp is a 64-bit field: high 32 bits seconds since
+                    # 1900-01-01, low 32 bits fractional seconds. Convert to unix.
+                    ntp_seconds = (info.ntp_timestamp >> 32) & 0xFFFFFFFF
+                    ntp_frac = info.ntp_timestamp & 0xFFFFFFFF
+                    NTP_UNIX_OFFSET = 2208988800  # seconds from 1900 to 1970
+                    ntp_unix = (ntp_seconds - NTP_UNIX_OFFSET) + (ntp_frac / 2**32)
+                    self._sr_anchor = (info.rtp_timestamp, ntp_unix)
+            except Exception:
+                pass
+            return await original(packet)
+
+        video_recv._handle_rtcp_packet = _wrapped
+        logger.info("WHEP RTCP SR hook installed — wallclock will use NTP-aligned anchor")
 
     async def _signal(self, aiohttp_mod) -> str:
         qs = f"?app={self._app}&stream={self._stream}"
@@ -261,14 +359,11 @@ class WHEPCapture:
                 self._height = int(frame.height)
                 self._ready.set()
 
-            # Map RTP pts → wallclock using first-frame anchor.
-            # Drift vs true source wallclock is bounded by the RTP/RTCP SR accuracy;
-            # good enough for HLS/WebRTC player offset sync.
-            try:
-                pts_sec = float((frame.pts - self._first_pts) * self._first_pts_time_base)
-            except Exception:
-                pts_sec = 0.0
-            wall_ts = (self._first_pts_wallclock or now) + pts_sec
+            # Map RTP pts → wallclock.
+            # Preferred: use the most recent RTCP Sender Report anchor (NTP-aligned,
+            # resyncs every ~5s, eliminates clock drift between source and our local
+            # `time.time()`). Fallback: first-PTS anchor (drift unbounded over time).
+            wall_ts = self._compute_wallclock(frame.pts, frame.time_base, now)
 
             # Drop-oldest policy: latency > completeness for live tracking.
             if self._frame_q.full():
