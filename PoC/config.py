@@ -58,6 +58,10 @@ class StreamConfig:
     reid_threshold: float = 0.5
     reid_global_id: bool = False
     reid_freeze_registered: bool = True  # True: 등록 프로필 특징 고정 (드리프트 방지)
+    # ReID feature extraction을 매 N YOLO 프레임마다만 실행 (Phase 3)
+    # 1 = 매 프레임 (기존 동작), 5 = 5프레임마다 1번 → CPU 30-50% 절감
+    # ID 보정 수렴은 N배 느려지지만 등록 프로필 매칭/global ID 정확도 영향 미미
+    reid_every_n_frames: int = 1
     # YOLO inference settings
     yolo_conf: float = 0.7              # confidence threshold
     yolo_iou: float = 0.5               # IoU threshold for NMS
@@ -141,6 +145,13 @@ class SystemConfig:
     metadata_ws_host: str = "0.0.0.0"
     metadata_ws_port: int = 8766
     metadata_ws_path: str = "/ws/metadata"
+    # Phase 4: batched detection. When True, all streams share a single YOLO
+    # model and detection is batched (model.predict([f1, f2, ...])); each
+    # stream still owns its own ByteTrack/BoT-SORT instance for ID isolation.
+    # Off by default — falls back to per-stream model.track() (legacy path).
+    batched_detection_enabled: bool = False
+    batched_detection_max_batch: int = 4   # cap per predict() call (4-8 typical on A100)
+    batched_detection_wait_ms: float = 5.0  # ms to wait for more frames to coalesce
 
     def to_dict(self) -> dict:
         data = {
@@ -164,6 +175,9 @@ class SystemConfig:
             "metadata_ws_host": self.metadata_ws_host,
             "metadata_ws_port": self.metadata_ws_port,
             "metadata_ws_path": self.metadata_ws_path,
+            "batched_detection_enabled": self.batched_detection_enabled,
+            "batched_detection_max_batch": self.batched_detection_max_batch,
+            "batched_detection_wait_ms": self.batched_detection_wait_ms,
         }
         return data
 
@@ -196,6 +210,9 @@ class SystemConfig:
             metadata_ws_host=data.get("metadata_ws_host", "0.0.0.0"),
             metadata_ws_port=data.get("metadata_ws_port", 8766),
             metadata_ws_path=data.get("metadata_ws_path", "/ws/metadata"),
+            batched_detection_enabled=data.get("batched_detection_enabled", False),
+            batched_detection_max_batch=data.get("batched_detection_max_batch", 4),
+            batched_detection_wait_ms=data.get("batched_detection_wait_ms", 5.0),
         )
 
     def save(self, path: str):

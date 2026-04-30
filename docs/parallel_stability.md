@@ -80,8 +80,8 @@ MultiStreamProcessor
 - [x] Phase 0: bathroom classifier eager-load
 - [x] **Phase 1**: GPU semaphore 설정화 (1번)
 - [x] **Phase 2**: uvloop 채택 (2번)
-- [ ] **Phase 3**: ReID 빈도 조절 (3'번)  ← 다음 작업
-- [ ] Phase 4: 배치 detection + standalone tracker (5+6번) — 큰 리팩토링
+- [x] **Phase 3**: ReID 빈도 조절 (3'번) — `StreamConfig.reid_every_n_frames` (default 1, 권장 3-5)
+- [ ] **Phase 4**: 배치 detection + standalone tracker (5+6번) — 진행 중
 - [ ] Phase 5 (조건부): multiprocessing 격리 (7번)
 
 **제외**: YOLO 모델 공유 — ultralytics tracker state가 model 내부에 있어서 불가능.

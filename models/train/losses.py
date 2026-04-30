@@ -178,22 +178,31 @@ class DistillationLoss:
         # 1. Standard task loss (student vs ground truth)
         task_loss, task_items = self.task_loss(student_preds, batch)
 
-        # 2. Teacher forward pass (triggers hooks to capture backbone features)
+        # 2. Teacher forward pass — keep the output for response distillation
+        # AND let registered hooks populate self.teacher_features for feature distillation.
         with torch.no_grad():
-            self.teacher(batch["img"])
+            teacher_preds = self.teacher(batch["img"])
 
-        # 3. Feature distillation loss (primary distillation via backbone hooks)
+        # 3a. Response distillation — KL on detection-head feature maps.
+        # _extract_feats normalizes the various ultralytics output shapes
+        # (training list, v10/v11 dict, eval-mode (decoded, raw) tuple).
+        student_feats = self._extract_feats(student_preds)
+        teacher_feats = self._extract_feats(teacher_preds)
+        resp_loss = self.response_loss(student_feats, teacher_feats)
+
+        # 3b. Feature distillation — L2/cosine on backbone feature hooks (optional).
         feat_loss = torch.tensor(0.0, device=self.device)
         if self.feature_loss_fn is not None and self.feature_layers:
             feat_loss = self.feature_loss_fn(
                 self.student_features, self.teacher_features, self.feature_layers
             )
 
-        # 4. Combine: (1-alpha)*task + alpha*feature_distill
-        total_distill = feat_loss
+        # 4. Combine. Both terms are 0-d scalars and weighted equally; alpha
+        # controls the task ↔ distill split as before.
+        total_distill = resp_loss + feat_loss
         combined_loss = (1 - self.alpha) * task_loss + self.alpha * total_distill.expand_as(task_loss)
 
-        # 7. Extend loss items for logging: [task_items..., distill]
+        # 5. Extend loss items for logging: [task_items..., distill]
         distill_item = total_distill.detach()
         if distill_item.dim() == 0:
             distill_item = distill_item.unsqueeze(0)
@@ -206,19 +215,29 @@ class DistillationLoss:
         """Extract raw feature map list from model predictions.
 
         Handles multiple ultralytics output formats:
-        - List/tuple of tensors (v8 training mode)
-        - Dict with "one2many" key (v10/v11 training mode)
-        - Tuple of (decoded, raw) (eval mode)
+        - Eval-mode tuple ``(decoded_tensor, raw_features_list)``
+        - Training list/tuple of feature tensors per FPN level
+        - v10/v11 training dict with key ``"one2many"`` or ``"feats"``
+        - Single tensor (rare)
         """
+        # Eval mode: (decoded_tensor, raw_features_list_or_tuple)
+        if (
+            isinstance(preds, tuple)
+            and len(preds) == 2
+            and isinstance(preds[0], torch.Tensor)
+            and isinstance(preds[1], (list, tuple))
+            and len(preds[1]) > 0
+            and isinstance(preds[1][0], torch.Tensor)
+        ):
+            return list(preds[1])
+        # Training mode: list/tuple of feature tensors
         if isinstance(preds, (list, tuple)) and len(preds) > 0 and isinstance(preds[0], torch.Tensor):
             return list(preds)
         if isinstance(preds, dict):
-            # Try known keys first
             for key in ("one2many", "feats"):
                 v = preds.get(key)
                 if isinstance(v, (list, tuple)) and len(v) > 0 and isinstance(v[0], torch.Tensor):
                     return list(v)
-            # Fallback: find any list/tuple of tensors in dict values
             for v in preds.values():
                 if isinstance(v, (list, tuple)) and len(v) > 0 and isinstance(v[0], torch.Tensor):
                     return list(v)

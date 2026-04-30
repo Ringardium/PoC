@@ -134,6 +134,10 @@ class StreamState:
         self.last_analysis_time: float = 0.0  # AdaptiveFPSController용 마지막 분석 시각
         # Static bowl ROI (tools.bowl_roi_detector 에서 1회 검출, 매 프레임 bowl YOLO 추론 skip)
         self.static_bowl_boxes: Optional["np.ndarray"] = None
+        # Phase 4 batched mode: per-stream standalone tracker (replaces in-model tracker
+        # when batched_detection_enabled=True; otherwise stays None and legacy
+        # model.track() path is used).
+        self.standalone_tracker: Optional["StandaloneTracker"] = None
 
     def init_behavior_state(self, max_number: int = 500):
         self.close_count = torch.zeros((max_number, max_number))
@@ -187,6 +191,12 @@ class MultiStreamProcessor:
         # Event clip recorders (per-stream, created after capture opens)
         self._clip_recorders: Dict[str, EventClipRecorder] = {}
 
+        # Phase 4: shared YOLO + batched predict (opt-in via config).
+        # When enabled, detection moves to BatchedDetector and per-stream
+        # state.model is left None; per-stream StandaloneTracker handles IDs.
+        self._batched_detector = None
+        self._batched_enabled: bool = bool(getattr(config, "batched_detection_enabled", False))
+
         # Optional metadata broadcaster (mobile overlay)
         self._metadata_sender = None
         if getattr(config, "metadata_ws_enabled", False):
@@ -216,6 +226,13 @@ class MultiStreamProcessor:
                 return True
         return False
 
+    def _pick_shared_iou(self) -> float:
+        """Median IoU across streams — used by BatchedDetector (one NMS per batch)."""
+        ious = sorted(sc.yolo_iou for sc in self.streams.values() if sc.yolo_classes)
+        if not ious:
+            return 0.5
+        return ious[len(ious) // 2]
+
     def _load_models(self):
         """Load per-stream YOLO model instances.
 
@@ -238,12 +255,39 @@ class MultiStreamProcessor:
             if gpu.enable_cudnn_benchmark:
                 torch.backends.cudnn.benchmark = True
 
-        # Create one YOLO instance per stream that needs detection.
-        # task="detect" is required for TensorRT .engine files (no task metadata).
-        for sid, sc in self.streams.items():
-            state = self._states[sid]
-            if sc.yolo_classes and state.model is None:
-                state.model = YOLO(model_path, task="detect")
+        if self._batched_enabled:
+            # Phase 4: one shared model lives inside BatchedDetector.
+            # state.model stays None; per-stream StandaloneTracker handles IDs.
+            from batched_detector import BatchedDetector
+            from standalone_tracker import StandaloneTracker
+
+            device = f"cuda:{gpu.device_id}" if torch.cuda.is_available() else "cpu"
+            self._batched_detector = BatchedDetector(
+                model_path=model_path,
+                device=device,
+                half=(gpu.half_precision and torch.cuda.is_available()),
+                max_batch=int(getattr(self.config, "batched_detection_max_batch", 4)),
+                batch_wait=float(getattr(self.config, "batched_detection_wait_ms", 5.0)) / 1000.0,
+                # iou is shared across the batch — pick the median of stream configs
+                # (most streams use the same value anyway).
+                iou=self._pick_shared_iou(),
+                verbose=False,
+            )
+            for sid, sc in self.streams.items():
+                state = self._states[sid]
+                if sc.yolo_classes and state.standalone_tracker is None:
+                    state.standalone_tracker = StandaloneTracker(
+                        method=sc.method if sc.method in ("bytetrack", "botsort") else "bytetrack",
+                        target_fps=sc.target_fps,
+                    )
+            logger.info("Phase 4 batched detection ENABLED — shared model + standalone trackers")
+        else:
+            # Legacy path: one YOLO instance per stream so model.track(persist=True)
+            # keeps tracker state isolated.
+            for sid, sc in self.streams.items():
+                state = self._states[sid]
+                if sc.yolo_classes and state.model is None:
+                    state.model = YOLO(model_path, task="detect")
 
         # Eager-load bathroom classifier once if any stream uses it, so the first
         # trigger frame doesn't stall for 1-2s loading YOLO. The classifier is a
@@ -296,11 +340,20 @@ class MultiStreamProcessor:
         if len(self.streams) >= self.config.processing.max_streams:
             return False
         self._register_stream(sc)
-        # Create per-stream model if needed
         state = self._states[sc.stream_id]
-        if sc.yolo_classes and state.model is None:
-            from ultralytics import YOLO
-            state.model = YOLO(self.config.model_path)
+        if sc.yolo_classes:
+            if self._batched_enabled and self._batched_detector is not None:
+                # Phase 4: just spin up a per-stream standalone tracker; the
+                # shared YOLO model already lives in BatchedDetector.
+                if state.standalone_tracker is None:
+                    from standalone_tracker import StandaloneTracker
+                    state.standalone_tracker = StandaloneTracker(
+                        method=sc.method if sc.method in ("bytetrack", "botsort") else "bytetrack",
+                        target_fps=sc.target_fps,
+                    )
+            elif state.model is None:
+                from ultralytics import YOLO
+                state.model = YOLO(self.config.model_path)
         # If already running, start the stream task
         if self.running and self._loop:
             task = self._loop.create_task(self._stream_loop(sc.stream_id))
@@ -327,6 +380,9 @@ class MultiStreamProcessor:
 
         if self._metadata_sender is not None:
             self._metadata_sender.start()
+
+        if self._batched_detector is not None:
+            self._batched_detector.start()
 
         # Start per-stream loops
         for sid in list(self.streams):
@@ -372,6 +428,11 @@ class MultiStreamProcessor:
         self._clip_recorders.clear()
         if self._metadata_sender is not None:
             self._metadata_sender.stop()
+        if self._batched_detector is not None:
+            try:
+                await self._batched_detector.stop()
+            except Exception as e:
+                logger.warning(f"BatchedDetector stop error: {e}")
 
     # ------------------------------------------------------------------
     # Per-stream processing loop
@@ -674,9 +735,16 @@ class MultiStreamProcessor:
                             state._frames_since_yolo = 0
 
                             t_yolo = time.perf_counter()
-                            frame, boxes, track_ids, bowl_boxes = await loop.run_in_executor(
-                                self._executor, self._run_tracking, sc, state, frame
-                            )
+                            if self._batched_enabled and self._batched_detector is not None:
+                                # Phase 4 path: batched detection + standalone tracker.
+                                # This method is async (awaits the batched detector).
+                                frame, boxes, track_ids, bowl_boxes = await self._run_tracking_batched(
+                                    sc, state, frame
+                                )
+                            else:
+                                frame, boxes, track_ids, bowl_boxes = await loop.run_in_executor(
+                                    self._executor, self._run_tracking, sc, state, frame
+                                )
                             state.last_proc_time = time.perf_counter() - t_yolo
 
                             # EMA smoothing to reduce bbox jitter
@@ -727,7 +795,10 @@ class MultiStreamProcessor:
                                     state.skip_counter = 0
 
                         # --- ReID correction (optional, only on YOLO frames) ---
-                        if run_yolo and state.reid_tracker is not None and len(boxes) > 0:
+                        # Phase 3: throttle to every N frames to cut CPU (default N=1 = 매 프레임)
+                        reid_n = max(1, getattr(sc, "reid_every_n_frames", 1))
+                        reid_due = (state.frame_cnt % reid_n == 0)
+                        if run_yolo and reid_due and state.reid_tracker is not None and len(boxes) > 0:
                             # --- Proximity lock: find track_ids whose bboxes are close ---
                             PROXIMITY_LOCK_DIST = 250  # pixels — lock corrections when closer
                             proximity_locked = set()
@@ -1194,6 +1265,130 @@ class MultiStreamProcessor:
     # YOLO tracking
     # ------------------------------------------------------------------
 
+    async def _run_tracking_batched(self, sc: StreamConfig, state: StreamState, frame: np.ndarray):
+        """Phase 4 path: detection via shared BatchedDetector, tracking via per-stream
+        StandaloneTracker. Returns the same tuple shape as :meth:`_run_tracking` so the
+        rest of the pipeline is unchanged.
+        """
+        if self._batched_detector is None or state.standalone_tracker is None:
+            # Defensive — shouldn't happen if _load_models ran with batched flag
+            return frame, [], [], []
+
+        det_classes = list(sc.yolo_classes or [1])
+        if sc.privacy and 0 not in det_classes:
+            det_classes.append(0)
+
+        try:
+            det = await self._batched_detector.detect(
+                stream_id=sc.stream_id, frame=frame, classes=det_classes, conf=sc.yolo_conf,
+            )
+        except Exception as e:
+            logger.warning(f"[{sc.stream_id}] batched detect failed: {e}")
+            return frame, [], [], []
+
+        # Apply tracker reset semantics (parity with model.track persist=False)
+        if state.reset_tracker:
+            state.standalone_tracker.reset()
+            state.reset_tracker = False
+            state.track_class_buffer.clear()
+
+        # Run per-stream tracker — returns (M, 7) [x1,y1,x2,y2, tid, score, cls]
+        tracks = state.standalone_tracker.update(det.xyxy, det.conf, det.cls, frame=frame)
+
+        if len(tracks) == 0:
+            state.no_detection_count += 1
+            if state.no_detection_count >= 90:
+                state.reset_tracker = True
+                state.no_detection_count = 0
+            # Privacy: even with zero pet tracks we may still have person dets in `det`
+            if sc.privacy:
+                state.last_person_boxes = self._extract_person_boxes_from_dets(det.xyxy, det.cls, frame)
+            return frame, [], [], []
+
+        state.no_detection_count = 0
+
+        # Class stabilization (3-frame voting — same logic as legacy _run_tracking)
+        track_xyxy = tracks[:, :4]
+        track_ids_raw = tracks[:, 4].astype(int).tolist()
+        track_cls_raw = tracks[:, 6].astype(int).tolist()
+
+        CLASS_STABLE_FRAMES = 3
+        stable_cls = []
+        for tid, raw_c in zip(track_ids_raw, track_cls_raw):
+            buf = state.track_class_buffer.get(tid)
+            if buf is None:
+                state.track_class_buffer[tid] = {'cls': raw_c}
+                stable_cls.append(raw_c)
+            elif raw_c == buf['cls']:
+                buf.pop('candidate', None); buf.pop('count', None)
+                stable_cls.append(raw_c)
+            elif buf.get('candidate') == raw_c:
+                buf['count'] = buf.get('count', 0) + 1
+                if buf['count'] >= CLASS_STABLE_FRAMES:
+                    buf['cls'] = raw_c
+                    buf.pop('candidate', None); buf.pop('count', None)
+                    stable_cls.append(raw_c)
+                else:
+                    stable_cls.append(buf['cls'])
+            else:
+                buf['candidate'] = raw_c; buf['count'] = 1
+                stable_cls.append(buf['cls'])
+
+        # Privacy: collect person bboxes (padded) using stabilized classes,
+        # PLUS any person detections that didn't survive the tracker (rare).
+        if sc.privacy:
+            person_boxes = []
+            for i, c in enumerate(stable_cls):
+                if c == 0:
+                    x1, y1, x2, y2 = map(int, track_xyxy[i])
+                    pad = 10
+                    x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+                    x2 = min(frame.shape[1], x2 + pad)
+                    y2 = min(frame.shape[0], y2 + pad)
+                    person_boxes.append([x1, y1, x2, y2])
+            state.last_person_boxes = person_boxes
+
+        # Split pets (class 1) vs bowls (class 3); convert pet boxes to xywh tensors
+        # to match the legacy interface consumed downstream by behavior detection.
+        pet_xywh = []
+        pet_ids = []
+        bowl_boxes = []
+        for i, c in enumerate(stable_cls):
+            x1, y1, x2, y2 = track_xyxy[i]
+            if c == 1:
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                w = x2 - x1
+                h = y2 - y1
+                pet_xywh.append(torch.tensor([cx, cy, w, h], dtype=torch.float32))
+                pet_ids.append(track_ids_raw[i])
+            elif c == 3:
+                bowl_boxes.append([x1, y1, x2, y2])
+
+        if pet_xywh:
+            boxes = torch.stack(pet_xywh)
+        else:
+            boxes = []
+        if bowl_boxes:
+            bowl_boxes = np.array(bowl_boxes, dtype=np.float32)
+
+        return frame, boxes, pet_ids, bowl_boxes
+
+    def _extract_person_boxes_from_dets(self, xyxy: np.ndarray, cls: np.ndarray, frame) -> list:
+        """Privacy fallback: pull person (cls 0) boxes directly from raw detections."""
+        out = []
+        if xyxy is None or len(xyxy) == 0:
+            return out
+        for i, c in enumerate(cls):
+            if int(c) == 0:
+                x1, y1, x2, y2 = map(int, xyxy[i])
+                pad = 10
+                x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+                x2 = min(frame.shape[1], x2 + pad)
+                y2 = min(frame.shape[0], y2 + pad)
+                out.append([x1, y1, x2, y2])
+        return out
+
     def _run_tracking(self, sc: StreamConfig, state: StreamState, frame: np.ndarray):
         """Run YOLO tracking on a single frame. Returns (frame, boxes, track_ids, bowl_boxes).
 
@@ -1516,9 +1711,12 @@ class MultiStreamProcessor:
         # Sleep detection (state dicts already keyed by behavior_id)
         sleep_set = set()
         if sc.task_sleep:
+            # detect_sleep 은 px/sec + seconds 를 기대 → target_fps 로 변환
+            _fps_s = sc.target_fps if sc.target_fps > 0 else 30
             sleep_ids = detect_sleep(
                 state.sleep_coor, state.sleep_bbox,
-                sc.sleep_threshold, sc.sleep_frames,
+                sc.sleep_threshold * _fps_s,   # px/frame → px/sec
+                sc.sleep_frames / _fps_s,      # frames → seconds
                 sc.sleep_aspect_ratio, sc.sleep_area_stability,
             )
             sleep_set = set(sleep_ids)
@@ -1614,7 +1812,13 @@ class MultiStreamProcessor:
         # Inert detection (sleep 감지된 ID 제외)
         inert_set = set()
         if sc.task_inert:
-            inert_ids = detect_inert(state.inert_coor, sc.inert_threshold, sc.inert_frames)
+            # detect_inert 은 px/sec + seconds 를 기대 → target_fps 로 변환
+            _fps_i = sc.target_fps if sc.target_fps > 0 else 30
+            inert_ids = detect_inert(
+                state.inert_coor,
+                sc.inert_threshold * _fps_i,   # px/frame → px/sec
+                sc.inert_frames / _fps_i,      # frames → seconds
+            )
             inert_set = set(inert_ids) - sleep_set  # sleep이 우선
             if len(inert_set) > 0:
                 for bid in (inert_set - state.prev_inert_ids):

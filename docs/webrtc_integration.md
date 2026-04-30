@@ -120,13 +120,32 @@ python main.py run --config whep_test_config.json
 
 ## 메타데이터 WebSocket 프로토콜
 
+양방향 프로토콜. 서버 → 클라이언트는 프레임/스냅샷/제어 응답을 보내고,
+클라이언트 → 서버는 구독·스냅샷 요청·핑을 보낸다.
+
 ### 연결
 
 ```
 ws://<gpu-host>:8766/ws/metadata
 ```
 
-### 수신 메시지 (JSON text frame, 프레임당 1개)
+연결 직후 서버가 `hello` 컨트롤 메시지로 현재 활성 stream_id 목록을 알려준다:
+```json
+{"type":"hello","streams":["every1","facility-ddnapet_gmail-every2"],"ts":1712345678.1}
+```
+
+### 서버 → 클라이언트 메시지
+
+| `type` | 용도 |
+|---|---|
+| `frame_metadata` | 매 프레임 bbox/track/behavior 페이로드 (아래 스키마) |
+| `hello` | 연결 직후 1회. 활성 stream_id 목록 |
+| `ack` | subscribe/unsubscribe 처리 결과 (`stream_ids` 필드에 현재 구독 상태) |
+| `snapshot` | `request_snapshot` 응답. `{stream_id, payload}` (payload=null 가능) |
+| `pong` | `ping` 응답. `{ts}` |
+| `error` | 잘못된 클라이언트 메시지 |
+
+#### `frame_metadata` 페이로드
 
 ```json
 {
@@ -146,6 +165,19 @@ ws://<gpu-host>:8766/ws/metadata
   "privacy_method": "blur"
 }
 ```
+
+### 클라이언트 → 서버 메시지
+
+| 메시지 | 효과 |
+|---|---|
+| `{"type":"subscribe","stream_ids":["s1","s2"]}` | 해당 stream_id만 받음. **빈 리스트** 또는 필드 생략 시 모든 스트림 구독(기본값) |
+| `{"type":"unsubscribe","stream_ids":["s1"]}` | 일부 스트림 구독 해제 (남은 구독이 비면 더 이상 frame_metadata를 받지 않음) |
+| `{"type":"unsubscribe_all"}` | 필터 해제, 다시 모든 스트림 수신 |
+| `{"type":"request_snapshot"}` | 현재 구독 중인(또는 모든) 스트림의 가장 최신 frame_metadata를 즉시 응답 |
+| `{"type":"ping"}` | `{"type":"pong","ts":...}` 응답 |
+
+> **모바일 권장 패턴**: 화면 진입 시 `subscribe`로 해당 카메라의 stream_id만 받고,
+> 즉시 `request_snapshot`을 보내 첫 박스를 빠르게 그린다. 화면 이탈 시 `unsubscribe_all` 후 close.
 
 | 필드 | 의미 |
 |---|---|
@@ -222,6 +254,6 @@ ws://<gpu-host>:8766/ws/metadata
 
 - [ ] RTCP SR 기반 pts→wallclock 동기화 (aiortc에서 SR 노출 후)
 - [ ] H.265 인그레스 지원 (PyAV HEVC 빌드)
-- [ ] 메타데이터 WS에 `client->server` 메시지 추가 (스트림 구독/언구독)
-- [ ] stream_id별 메타 필터링 (현재 모든 클라이언트에 모든 스트림 전송)
+- [x] 메타데이터 WS에 `client->server` 메시지 추가 (스트림 구독/언구독)
+- [x] stream_id별 메타 필터링 (현재 모든 클라이언트에 모든 스트림 전송)
 - [ ] 행동 이벤트 시작/종료(Onset/Offset) 별도 타입 추가

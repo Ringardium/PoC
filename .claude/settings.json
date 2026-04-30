@@ -6,7 +6,8 @@
       "Bash(python3 -c ' *)",
       "Bash(grep -n \"^    [a-z_]*,$\\\\|\\\\bthreshold\\\\b\\\\|\\\\bbowl_conf\\\\b\\\\|\\\\bfont_path\\\\b\" /Users/gentiqxpc1/Documents/Garin/code/PoC/main.py)",
       "Bash(awk '/^def main/,EOF {print}' /Users/gentiqxpc1/Documents/Garin/code/PoC/main.py)",
-      "Bash(awk '/^def main/,EOF {print}' /Users/gentiqxpc1/Documents/Garin/code/PoC/PoC/web_server.py)"
+      "Bash(awk '/^def main/,EOF {print}' /Users/gentiqxpc1/Documents/Garin/code/PoC/PoC/web_server.py)",
+      "Read(//Users/gentiqxpc1/Documents/Garin/code/**)"
     ]
   }
 }

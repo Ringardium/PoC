@@ -1,3 +1,4 @@
+import time
 from collections import deque
 
 import av
@@ -795,14 +796,17 @@ def main(
                 continue
 
             # 중심점 좌표 수집
+            # detect_inert/detect_sleep 은 FPS-independent 로 리팩토링되어 (timestamp, x, y) 기대.
+            # detect_eat/detect_bathroom 은 여전히 (x, y) 형식.
+            _now = time.time()
             x_centers, y_centers = [], []
             for id, box in zip(track_ids, boxes):
                 x_center, y_center, width, height = box
                 x_centers.append(x_center)
                 y_centers.append(y_center)
-                inert_coor[id].append([x_center, y_center])
-                sleep_coor[id].append([x_center, y_center])
-                sleep_bbox[id].append([width, height])
+                inert_coor[id].append((_now, x_center, y_center))
+                sleep_coor[id].append((_now, x_center, y_center))
+                sleep_bbox[id].append((_now, width, height))
                 eat_coor[id].append([x_center, y_center])
                 bathroom_coor[id].append([x_center, y_center])
                 bathroom_bbox[id].append([width, height])
@@ -869,11 +873,13 @@ def main(
             # detect sleep (inert보다 먼저 — sleep이 우선)
             sleep_indices = []
             if task_sleep:
+                # detect_sleep 은 px/sec + seconds 를 기대 → fps 로 변환
+                _fps_s = fps if fps > 0 else 30
                 sleep_indices = detect_sleep(
                     sleep_coor,
                     sleep_bbox,
-                    sleep_threshold,
-                    sleep_frames,
+                    sleep_threshold * _fps_s,   # px/frame → px/sec
+                    sleep_frames / _fps_s,      # frames → seconds
                     sleep_aspect_ratio,
                     sleep_area_stability,
                 )
@@ -888,10 +894,12 @@ def main(
 
             # detect inert (sleep 감지된 ID 제외)
             if task_inert:
+                # detect_inert 은 px/sec + seconds 를 기대 → fps 로 변환
+                _fps_i = fps if fps > 0 else 30
                 inert_indices = detect_inert(
                     inert_coor,
-                    inert_threshold,
-                    inert_frames,
+                    inert_threshold * _fps_i,   # px/frame → px/sec
+                    inert_frames / _fps_i,      # frames → seconds
                 )
 
                 sleep_set = set(sleep_indices)
