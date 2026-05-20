@@ -40,7 +40,41 @@
       "WebFetch(domain:docs.ultralytics.com)",
       "Bash(cd:*)",
       "Bash(cd C:\\\\Users\\\\garin\\\\Documents\\\\업무\\\\떠나펫\\\\code\\\\pet_tracker_final:*)",
-      "Bash(df -h /c/Users/garin/Documents/업무/떠나펫/code/pet_tracker_final 2>/dev/null || df -h / 2>/dev/null || echo \"checking disk space...\" && powershell.exe -Command \"Get-PSDrive C | Select-Object Used,Free\" 2>/dev/null)"
+      "Bash(df -h /c/Users/garin/Documents/업무/떠나펫/code/pet_tracker_final 2>/dev/null || df -h / 2>/dev/null || echo \"checking disk space...\" && powershell.exe -Command \"Get-PSDrive C | Select-Object Used,Free\" 2>/dev/null)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3)",
+      "Bash(npx --no-install tsc --noEmit -p tsconfig.json)",
+      "Bash(node_modules/.bin/tsc --noEmit -p tsconfig.json)",
+      "Bash(node -e ' *)",
+      "Bash(mkdir -p /Users/gentiqxpc1/Documents/Garin/code/MUNG-AI-APP/docs)",
+      "Bash(node --check /Users/gentiqxpc1/Documents/Garin/code/MUNG-AI-APP/backend/routes/auth.js)",
+      "Bash(node --check /Users/gentiqxpc1/Documents/Garin/code/MUNG-AI-APP/backend/routes/config.js)",
+      "Bash(node --check /Users/gentiqxpc1/Documents/Garin/code/MUNG-AI-APP/backend/server.js)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(s['name'], '| vhost:', s['vhost'], '| active:', s.get\\('publish',{}\\).get\\('active'\\)\\) for s in d.get\\('streams',[]\\)]\")",
+      "Bash(/usr/libexec/java_home -v 17)",
+      "Bash(export JAVA_HOME=$\\(/usr/libexec/java_home -v 17\\))",
+      "Bash(export ANDROID_SDK_ROOT=\"$HOME/Library/Android/sdk\")",
+      "Bash(export ANDROID_HOME=\"$HOME/Library/Android/sdk\")",
+      "Bash(java -version)",
+      "Bash(npx @react-native-community/cli bundle --platform android --dev false --entry-file index.js --bundle-output android/app/src/main/assets/index.android.bundle --assets-dest android/app/src/main/res)",
+      "Bash(node_modules/.bin/react-native --help)",
+      "Bash(grep -iA2 \"commands\\\\|bundle\")",
+      "Bash(DEBUG='*' node_modules/.bin/react-native bundle --platform android --dev false --entry-file index.js --bundle-output /tmp/test.bundle)",
+      "Bash(grep -iv \"^$\")",
+      "Bash(node_modules/.bin/rnc-cli bundle *)",
+      "Bash(node -e \"try{const c=require\\('react-native/react-native.config.js'\\); console.log\\('keys:', Object.keys\\(c\\)\\); console.log\\('commands:', \\(c.commands||[]\\).map\\(x=>x.name\\)\\);}catch\\(e\\){console.log\\('THREW:', e.message\\)}\")",
+      "Bash(node -e \"try{const p=require\\('@react-native/community-cli-plugin'\\); console.log\\(Object.keys\\(p\\)\\);}catch\\(e\\){console.log\\('THREW:',e.message\\)}\")",
+      "Bash(node -e \"const c=require\\('react-native/react-native.config.js'\\); console.log\\('commands:', \\(c.commands||[]\\).map\\(x=>x.name\\)\\);\")",
+      "Bash(chmod +x ./gradlew)",
+      "Bash(./gradlew assembleDebug --no-daemon --console=plain)",
+      "Bash(tee /tmp/mungai_build.log)",
+      "Bash(tee /tmp/mungai_build2.log)",
+      "Bash(cd /Users/gentiqxpc1/Documents/Garin/code/MUNG-AI-APP/MungAI/android && grep -E \"BUILD SUCCESSFUL|BUILD FAILED\" /tmp/mungai_build2.log | tail -1; ls -lh app/build/outputs/apk/debug/app-debug.apk; echo \"--- verify PROD ws baked into bundle ---\" && grep -c \"ai.mungwoofai.cloud/ws/metadata\" app/app/src/main/assets/index.android.bundle 2>/dev/null || grep -c \"ai.mungwoofai.cloud/ws/metadata\" app/src/main/assets/index.android.bundle 2>/dev/null)",
+      "Read(//private/tmp/**)",
+      "Bash(node -e \"require\\('bcrypt'\\); console.log\\('bcrypt ok'\\)\")"
+    ],
+    "additionalDirectories": [
+      "/Users/gentiqxpc1/Documents/Garin/code/MUNG-AI-APP"
     ]
   }
 }

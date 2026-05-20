@@ -211,6 +211,23 @@ class MultiStreamProcessor:
                 logger.warning(f"MetadataSender init failed, disabling: {e}")
                 self._metadata_sender = None
 
+        # Optional crop collector (ReID 학습 데이터 자동 수집)
+        self._crop_collector = None
+        if getattr(config, "crop_collect_enabled", False):
+            try:
+                from crop_collector import CropCollector
+                self._crop_collector = CropCollector(
+                    output_dir=config.crop_output_dir,
+                    enabled=True,
+                    sample_interval_sec=config.crop_sample_interval_sec,
+                    max_per_track=config.crop_max_per_track,
+                    min_box_size=config.crop_min_box_size,
+                    blur_threshold=config.crop_blur_threshold,
+                )
+            except Exception as e:
+                logger.warning(f"CropCollector init failed, disabling: {e}")
+                self._crop_collector = None
+
         # Register initial streams
         for sc in config.streams:
             self._register_stream(sc)
@@ -381,6 +398,9 @@ class MultiStreamProcessor:
         if self._metadata_sender is not None:
             self._metadata_sender.start()
 
+        if self._crop_collector is not None:
+            self._crop_collector.start()
+
         if self._batched_detector is not None:
             self._batched_detector.start()
 
@@ -428,6 +448,8 @@ class MultiStreamProcessor:
         self._clip_recorders.clear()
         if self._metadata_sender is not None:
             self._metadata_sender.stop()
+        if self._crop_collector is not None:
+            self._crop_collector.stop()
         if self._batched_detector is not None:
             try:
                 await self._batched_detector.stop()
@@ -758,6 +780,11 @@ class MultiStreamProcessor:
                             state.last_boxes = boxes
                             state.last_track_ids = track_ids
                             state.last_bowl_boxes = bowl_boxes
+
+                            # ReID 학습 데이터 수집 — YOLO 가 실제 실행된 프레임만 (skip 프레임 제외).
+                            # 논블로킹: 큐에 적재만 하고 디스크 I/O 는 백그라운드 스레드.
+                            if self._crop_collector is not None:
+                                self._crop_collector.submit(sc.stream_id, frame, boxes, track_ids)
 
                             # Update AdaptiveFPSController (컨텐츠 기반 다음 skip 결정)
                             if state.adaptive_fps_ctrl is not None:
@@ -1882,6 +1909,10 @@ class MultiStreamProcessor:
             if src_ts is not None:
                 ts = src_ts
             meta_tracks = []
+            # Convert per-frame velocity (state.last_velocities) → px/sec so the
+            # app can extrapolate bbox between metadata arrivals (esp. useful
+            # when adaptive_fps_enabled drops to low fps for idle scenes).
+            vel_scale = float(max(1, sc.target_fps))
             for tid, box in zip(track_ids, boxes):
                 if hasattr(box, 'tolist'):
                     bx = box.tolist()
@@ -1889,11 +1920,13 @@ class MultiStreamProcessor:
                     bx = list(box)
                 gid = state.global_id_map.get(tid)
                 bid = tid_to_bid.get(tid, tid)
+                vx_pf, vy_pf = state.last_velocities.get(tid, (0.0, 0.0))
                 meta_tracks.append({
                     "tid": int(tid),
                     "gid": int(gid) if gid is not None else None,
                     "pet_name": state.global_id_names.get(gid) if gid is not None else None,
                     "bbox_xywh": [float(bx[0]), float(bx[1]), float(bx[2]), float(bx[3])],
+                    "vel_xy": [float(vx_pf) * vel_scale, float(vy_pf) * vel_scale],  # px/sec
                     "behavior": dog_behavior.get(bid, "normal"),
                 })
             payload = {

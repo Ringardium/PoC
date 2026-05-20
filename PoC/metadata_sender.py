@@ -15,6 +15,8 @@ Server → client wire format (JSON text frame):
           "gid": 3,                   // ReID global ID (stable across streams), or null
           "pet_name": "뽀삐",          // from pet_profiles, or null
           "bbox_xywh": [cx, cy, w, h],// center-xywh in source pixels
+          "vel_xy": [vx, vy],         // px/sec (server-tracked). client extrapolates
+                                      // bbox between arrivals for smooth low-fps overlay
           "behavior": "sleeping"      // one of: normal, fight, escape, sleeping,
                                       //         bathroom, feeding, playing, inactive
         }, ...

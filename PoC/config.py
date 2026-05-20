@@ -152,6 +152,13 @@ class SystemConfig:
     batched_detection_enabled: bool = False
     batched_detection_max_batch: int = 4   # cap per predict() call (4-8 typical on A100)
     batched_detection_wait_ms: float = 5.0  # ms to wait for more frames to coalesce
+    # ReID 학습 데이터 수집 — track 별 crop 을 디스크에 비동기 저장 (off by default)
+    crop_collect_enabled: bool = False
+    crop_output_dir: str = "crops"          # 출력 루트 디렉토리
+    crop_sample_interval_sec: float = 1.0   # track 당 N초에 1장
+    crop_max_per_track: int = 60            # track 당 최대 장수
+    crop_min_box_size: int = 48             # 최소 bbox 픽셀 (이하 제외)
+    crop_blur_threshold: float = 20.0       # Laplacian variance 미만이면 흐림 제외
 
     def to_dict(self) -> dict:
         data = {
@@ -178,6 +185,12 @@ class SystemConfig:
             "batched_detection_enabled": self.batched_detection_enabled,
             "batched_detection_max_batch": self.batched_detection_max_batch,
             "batched_detection_wait_ms": self.batched_detection_wait_ms,
+            "crop_collect_enabled": self.crop_collect_enabled,
+            "crop_output_dir": self.crop_output_dir,
+            "crop_sample_interval_sec": self.crop_sample_interval_sec,
+            "crop_max_per_track": self.crop_max_per_track,
+            "crop_min_box_size": self.crop_min_box_size,
+            "crop_blur_threshold": self.crop_blur_threshold,
         }
         return data
 
@@ -213,6 +226,12 @@ class SystemConfig:
             batched_detection_enabled=data.get("batched_detection_enabled", False),
             batched_detection_max_batch=data.get("batched_detection_max_batch", 4),
             batched_detection_wait_ms=data.get("batched_detection_wait_ms", 5.0),
+            crop_collect_enabled=data.get("crop_collect_enabled", False),
+            crop_output_dir=data.get("crop_output_dir", "crops"),
+            crop_sample_interval_sec=data.get("crop_sample_interval_sec", 1.0),
+            crop_max_per_track=data.get("crop_max_per_track", 60),
+            crop_min_box_size=data.get("crop_min_box_size", 48),
+            crop_blur_threshold=data.get("crop_blur_threshold", 20.0),
         )
 
     def save(self, path: str):
