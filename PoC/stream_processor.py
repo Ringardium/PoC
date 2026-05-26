@@ -211,6 +211,23 @@ class MultiStreamProcessor:
                 logger.warning(f"MetadataSender init failed, disabling: {e}")
                 self._metadata_sender = None
 
+        # Optional pet sync (시설 등록 강아지 → ReID gallery 자동 동기화)
+        self._pet_sync = None
+        if getattr(config, "pet_sync_enabled", False):
+            try:
+                from pet_sync import PetSync
+                stream_ids = [s.stream_id for s in config.streams]
+                self._pet_sync = PetSync(
+                    base_url=config.pet_sync_base_url,
+                    stream_ids=stream_ids,
+                    references_dir=config.pet_sync_references_dir,
+                    interval_sec=config.pet_sync_interval_sec,
+                    on_change=self._reload_pet_profiles,
+                )
+            except Exception as e:
+                logger.warning(f"PetSync init failed, disabling: {e}")
+                self._pet_sync = None
+
         # Optional crop collector (ReID 학습 데이터 자동 수집)
         self._crop_collector = None
         if getattr(config, "crop_collect_enabled", False):
@@ -223,6 +240,9 @@ class MultiStreamProcessor:
                     max_per_track=config.crop_max_per_track,
                     min_box_size=config.crop_min_box_size,
                     blur_threshold=config.crop_blur_threshold,
+                    s3_bucket=config.crop_s3_bucket,
+                    s3_prefix=config.crop_s3_prefix,
+                    delete_after_upload=config.crop_delete_after_upload,
                 )
             except Exception as e:
                 logger.warning(f"CropCollector init failed, disabling: {e}")
@@ -401,6 +421,9 @@ class MultiStreamProcessor:
         if self._crop_collector is not None:
             self._crop_collector.start()
 
+        if self._pet_sync is not None:
+            self._pet_sync.start()
+
         if self._batched_detector is not None:
             self._batched_detector.start()
 
@@ -420,6 +443,38 @@ class MultiStreamProcessor:
             pass
         finally:
             await self._cleanup()
+
+    def _reload_pet_profiles(self):
+        """PetSync 변경 콜백 — 모든 stream 의 ReID gallery 와 이름 매핑을 재로딩.
+
+        metadata push 시 state.global_id_names.get(gid) 로 pet_name 을 채우므로
+        여기서 이름 매핑을 갱신하면 모바일 오버레이 라벨도 자동으로 새 이름이 들어간다.
+        """
+        try:
+            from tools.pet_profiles import PetProfileStore
+            references_dir = getattr(self.config, "pet_sync_references_dir", "references")
+            store = PetProfileStore(references_dir)
+            store.load()
+            name_map = store.get_name_map()
+        except Exception as e:
+            logger.warning(f"PetProfileStore reload failed: {e}")
+            return
+
+        for state in self._states.values():
+            # 1) 이름 매핑 갱신 — metadata push (pet_name) 즉시 반영
+            try:
+                state.global_id_names = dict(name_map)
+            except Exception:
+                pass
+            # 2) ReID gallery 재등록 (해당 stream 이 reid 활성일 때만)
+            tracker = getattr(state, "reid_tracker", None)
+            if tracker is not None and hasattr(tracker, "register_pet_profiles"):
+                try:
+                    tracker.register_pet_profiles(references_dir)
+                except Exception as e:
+                    logger.debug(f"register_pet_profiles failed: {e}")
+        logger.info(f"PetSync reloaded — {len(name_map)} pets registered, "
+                    f"streams={len(self._states)}")
 
     def stop(self):
         """Signal all processing to stop."""
@@ -450,6 +505,8 @@ class MultiStreamProcessor:
             self._metadata_sender.stop()
         if self._crop_collector is not None:
             self._crop_collector.stop()
+        if self._pet_sync is not None:
+            self._pet_sync.stop()
         if self._batched_detector is not None:
             try:
                 await self._batched_detector.stop()

@@ -159,6 +159,14 @@ class SystemConfig:
     crop_max_per_track: int = 60            # track 당 최대 장수
     crop_min_box_size: int = 48             # 최소 bbox 픽셀 (이하 제외)
     crop_blur_threshold: float = 20.0       # Laplacian variance 미만이면 흐림 제외
+    crop_s3_bucket: Optional[str] = None    # 지정 시 crop 을 S3 업로드 (None = 로컬만)
+    crop_s3_prefix: str = "crops"           # S3 key prefix
+    crop_delete_after_upload: bool = True    # 업로드 성공 시 로컬 파일 삭제 (디스크 절약)
+    # 시설 등록 강아지 자동 동기화 (backend dogs API → PetProfileStore + ReID gallery)
+    pet_sync_enabled: bool = False
+    pet_sync_base_url: str = "https://api.mungwoofai.cloud"
+    pet_sync_interval_sec: float = 60.0
+    pet_sync_references_dir: str = "references"
 
     def to_dict(self) -> dict:
         data = {
@@ -191,11 +199,24 @@ class SystemConfig:
             "crop_max_per_track": self.crop_max_per_track,
             "crop_min_box_size": self.crop_min_box_size,
             "crop_blur_threshold": self.crop_blur_threshold,
+            "crop_s3_bucket": self.crop_s3_bucket,
+            "crop_s3_prefix": self.crop_s3_prefix,
+            "crop_delete_after_upload": self.crop_delete_after_upload,
+            "pet_sync_enabled": self.pet_sync_enabled,
+            "pet_sync_base_url": self.pet_sync_base_url,
+            "pet_sync_interval_sec": self.pet_sync_interval_sec,
+            "pet_sync_references_dir": self.pet_sync_references_dir,
         }
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "SystemConfig":
+        # 새 포맷 (facilities + cameras + defaults) 이면 streams 배열로 펼친다.
+        # 기존 streams 배열 포맷은 그대로 통과.
+        if "facilities" in data:
+            from config_expand import expand_facilities_to_streams
+            data = expand_facilities_to_streams(data)
+
         gpu = GPUConfig(**data.get("gpu", {}))
 
         proc_data = data.get("processing", {})
@@ -232,6 +253,13 @@ class SystemConfig:
             crop_max_per_track=data.get("crop_max_per_track", 60),
             crop_min_box_size=data.get("crop_min_box_size", 48),
             crop_blur_threshold=data.get("crop_blur_threshold", 20.0),
+            crop_s3_bucket=data.get("crop_s3_bucket"),
+            crop_s3_prefix=data.get("crop_s3_prefix", "crops"),
+            crop_delete_after_upload=data.get("crop_delete_after_upload", True),
+            pet_sync_enabled=data.get("pet_sync_enabled", False),
+            pet_sync_base_url=data.get("pet_sync_base_url", "https://api.mungwoofai.cloud"),
+            pet_sync_interval_sec=data.get("pet_sync_interval_sec", 60.0),
+            pet_sync_references_dir=data.get("pet_sync_references_dir", "references"),
         )
 
     def save(self, path: str):

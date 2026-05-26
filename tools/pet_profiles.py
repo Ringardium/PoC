@@ -21,6 +21,7 @@ import shutil
 import logging
 from pathlib import Path
 from datetime import datetime
+from typing import List, Optional
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict
 
@@ -106,11 +107,21 @@ class PetProfileStore:
         logger.info(f"{len(self.profiles)}개 펫 프로필 저장 완료: {self.json_path}")
 
     def add_pet(self, name: str, species: str = "", breed: str = "",
-                color: str = "", notes: str = "") -> int:
-        """펫 추가, global_id 반환"""
+                color: str = "", notes: str = "",
+                global_id: Optional[int] = None) -> int:
+        """펫 추가, global_id 반환.
+
+        global_id 명시 시 그 값으로 등록 (backend dogs.id 직접 매핑용).
+        명시 안 하면 내부 _next_id 자동 발급.
+        """
         now = datetime.now().isoformat(timespec='seconds')
-        global_id = self._next_id
-        self._next_id += 1
+        if global_id is None:
+            global_id = self._next_id
+            self._next_id += 1
+        else:
+            # 외부 지정 ID → 다음 자동 ID 가 충돌하지 않도록 _next_id 도 갱신
+            if global_id >= self._next_id:
+                self._next_id = global_id + 1
 
         profile = PetProfile(
             global_id=global_id,

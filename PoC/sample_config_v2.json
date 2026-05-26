@@ -1,0 +1,145 @@
+{
+  "model_path": "/home/elicer/PoC/weights/best.engine",
+  "gpu": {
+    "device_id": 0,
+    "memory_fraction": 0.9,
+    "half_precision": true,
+    "batch_size": 1,
+    "enable_cudnn_benchmark": true,
+    "enable_tf32": true
+  },
+  "processing": {
+    "max_streams": 5,
+    "target_resolution": [640, 640],
+    "frame_buffer_size": 30,
+    "inference_timeout": 0.066,
+    "enable_adaptive_skip": true,
+    "max_frame_skip": 2,
+    "min_fps_threshold": 10
+  },
+
+  "defaults": {
+    "method": "bytetrack",
+    "target_fps": 15,
+    "priority": 1,
+    "threshold": 0.3,
+    "fight_speed_threshold": 5.0,
+    "inert_threshold": 1.0,
+    "inert_frames": 300,
+    "active_threshold": 1000.0,
+    "active_frames": 100,
+    "active_speed_threshold": 5.0,
+    "sleep_threshold": 30.0,
+    "sleep_frames": 500,
+    "sleep_aspect_ratio": 1.2,
+    "sleep_area_stability": 0.15,
+    "label_registered_only": false,
+    "show_track_id": true,
+    "privacy": true,
+    "privacy_method": "blur",
+    "privacy_model": "/home/elicer/PoC/weights/best.engine",
+    "tasks": {
+      "fight": true,
+      "escape": false,
+      "inert": true,
+      "sleep": true,
+      "eat": false,
+      "bathroom": false,
+      "active": true
+    },
+    "yolo": {
+      "conf": 0.15,
+      "iou": 0.5,
+      "classes": [1],
+      "augment": false,
+      "agnostic_nms": false,
+      "verbose": false,
+      "persist": true
+    },
+    "reid": {
+      "use_reid": false,
+      "method": "adaptive",
+      "threshold": 0.5,
+      "global_id": true,
+      "freeze_registered": true,
+      "every_n_frames": 5
+    },
+    "adaptive_fps": {
+      "enabled": true,
+      "max": 15.0,
+      "idle": 10.0,
+      "min": 1.0,
+      "displacement_low": 1.0,
+      "displacement_high": 50.0
+    }
+  },
+
+  "facilities": [
+    {
+      "user_type": "facility",
+      "user_slug": "bouncedog04_gmail",
+      "cameras": [
+        {
+          "name": "every1",
+          "overrides": {
+            "inert_frames": 600,
+            "sleep_frames": 1000,
+            "active_frames": 200,
+            "tasks": { "eat": true, "bathroom": true },
+            "reid":  { "use_reid": true }
+          }
+        },
+        { "name": "every2" },
+        {
+          "name": "every4",
+          "overrides": {
+            "tasks": { "eat": true, "bathroom": true }
+          }
+        },
+        {
+          "name": "every6",
+          "overrides": {
+            "yolo": { "conf": 0.2, "iou": 0.7 },
+            "reid": { "global_id": false }
+          }
+        },
+        {
+          "name": "every8",
+          "overrides": {
+            "threshold": 0.18,
+            "reid":  { "use_reid": true }
+          }
+        },
+        {
+          "name": "home1",
+          "overrides": {
+            "tasks": { "eat": true },
+            "reid":  { "use_reid": true }
+          }
+        }
+      ]
+    }
+  ],
+
+  "srs": { "host": "118.41.173.32", "port": 2985, "vhost": "kr" },
+
+  "log_level": "INFO",
+  "stats_interval": 5.0,
+  "event_api_url": "https://api.mungwoofai.cloud/api/ai/behavior-detection",
+  "hls_s3_bucket": "ddnapet-media-bucket",
+  "hls_s3_prefix": "hls/live",
+  "clip_s3_prefix": "clips/events",
+  "clip_pre_seconds": 2.0,
+  "clip_post_seconds": 2.0,
+  "cdn_base_url": "https://cdn.mungwoofai.cloud",
+
+  "metadata_ws_enabled": true,
+  "metadata_ws_host": "0.0.0.0",
+  "metadata_ws_port": 8766,
+  "metadata_ws_path": "/ws/metadata",
+
+  "pet_sync_enabled": true,
+  "pet_sync_base_url": "https://api.mungwoofai.cloud",
+  "pet_sync_interval_sec": 60.0,
+  "pet_sync_references_dir": "references"
+}
