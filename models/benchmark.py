@@ -320,9 +320,9 @@ def _raw_to_dets(
             raw = raw.T
 
     # raw: (nc+4, num_anchors)
-    # 처음 4행: cx, cy, w, h (pixel coords, imgsz 기준)
+    # 처음 4행: box (cx,cy,w,h 또는 x1,y1,x2,y2 — export에 따라 다름)
     # 나머지: class scores
-    boxes_xywh = raw[:4].T          # (num_anchors, 4)
+    boxes_raw = raw[:4].T           # (num_anchors, 4)
     class_scores = raw[4:].T        # (num_anchors, nc)
 
     # 클래스별 최대 score + class_id
@@ -334,16 +334,27 @@ def _raw_to_dets(
     if not np.any(mask):
         return np.zeros((0, 6), dtype=np.float32)
 
-    boxes_xywh = boxes_xywh[mask]
+    boxes_raw = boxes_raw[mask]
     max_scores = max_scores[mask]
     class_ids = class_ids[mask]
 
-    # xywh → x1y1x2y2
-    x1 = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2
-    y1 = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2
-    x2 = boxes_xywh[:, 0] + boxes_xywh[:, 2] / 2
-    y2 = boxes_xywh[:, 1] + boxes_xywh[:, 3] / 2
-    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+    # box 포맷 자동 감지: split export는 이미 xyxy(x1,y1,x2,y2)로 출력하고,
+    # 표준 YOLO raw는 xywh(cx,cy,w,h). 고신뢰 박스에서 x2>x1 & y2>y1가
+    # 대부분 성립하면 xyxy로 간주 (xywh를 xyxy로 읽으면 w>cx가 필요해 보통 깨짐).
+    hi = max_scores >= max(conf, 0.1)
+    sample = boxes_raw[hi] if np.any(hi) else boxes_raw
+    is_xyxy = np.mean((sample[:, 2] > sample[:, 0]) &
+                      (sample[:, 3] > sample[:, 1])) > 0.9
+
+    if is_xyxy:
+        boxes_xyxy = boxes_raw
+    else:
+        # xywh → x1y1x2y2
+        x1 = boxes_raw[:, 0] - boxes_raw[:, 2] / 2
+        y1 = boxes_raw[:, 1] - boxes_raw[:, 3] / 2
+        x2 = boxes_raw[:, 0] + boxes_raw[:, 2] / 2
+        y2 = boxes_raw[:, 1] + boxes_raw[:, 3] / 2
+        boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
 
     # 클래스별 NMS
     keep_all = []

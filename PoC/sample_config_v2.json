@@ -19,7 +19,7 @@
   },
 
   "defaults": {
-    "method": "bytetrack",
+    "method": "botsort",
     "target_fps": 15,
     "priority": 1,
     "threshold": 0.3,
@@ -43,8 +43,8 @@
       "escape": false,
       "inert": true,
       "sleep": true,
-      "eat": false,
-      "bathroom": false,
+      "eat": true,
+      "bathroom": true,
       "active": true
     },
     "yolo": {
@@ -57,7 +57,7 @@
       "persist": true
     },
     "reid": {
-      "use_reid": false,
+      "use_reid": true,
       "method": "adaptive",
       "threshold": 0.5,
       "global_id": true,
@@ -77,7 +77,7 @@
   "facilities": [
     {
       "user_type": "facility",
-      "user_slug": "bouncedog04_gmail",
+      "user_slug": "ddnapet_gmail",
       "cameras": [
         {
           "name": "every1",
@@ -85,43 +85,36 @@
             "inert_frames": 600,
             "sleep_frames": 1000,
             "active_frames": 200,
-            "tasks": { "eat": true, "bathroom": true },
-            "reid":  { "use_reid": true }
+            "yolo": { "conf": 0.18, "iou": 0.7 }
           }
         },
-        { "name": "every2" },
         {
-          "name": "every4",
+          "name": "every2",
           "overrides": {
-            "tasks": { "eat": true, "bathroom": true }
+            "reid": { "use_reid": false }
           }
         },
+        { "name": "every4" },
         {
           "name": "every6",
           "overrides": {
-            "yolo": { "conf": 0.2, "iou": 0.7 },
-            "reid": { "global_id": false }
+            "yolo": { "conf": 0.2, "iou": 0.7 }
           }
         },
         {
           "name": "every8",
           "overrides": {
             "threshold": 0.18,
-            "reid":  { "use_reid": true }
+            "label_registered_only": true,
+            "tasks": { "eat": false, "bathroom": false }
           }
         },
-        {
-          "name": "home1",
-          "overrides": {
-            "tasks": { "eat": true },
-            "reid":  { "use_reid": true }
-          }
-        }
+        { "name": "home1" }
       ]
     }
   ],
 
-  "srs": { "host": "118.41.173.32", "port": 2985, "vhost": "kr" },
+  "srs": { "host": "118.41.173.32", "port": 1985, "vhost": "kr" },
 
   "log_level": "INFO",
   "stats_interval": 5.0,
@@ -137,6 +130,13 @@
   "metadata_ws_host": "0.0.0.0",
   "metadata_ws_port": 8766,
   "metadata_ws_path": "/ws/metadata",
+
+  "crop_collect_enabled": true,
+  "crop_output_dir": "/home/elicer/PoC/photos/crops",
+  "crop_sample_interval_sec": 1.0,
+  "crop_max_per_track": 60,
+  "crop_min_box_size": 48,
+  "crop_blur_threshold": 20.0,
 
   "pet_sync_enabled": true,
   "pet_sync_base_url": "https://api.mungwoofai.cloud",
